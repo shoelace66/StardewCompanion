@@ -26,10 +26,7 @@ try{
     if(-not $ready){throw '本机诊断服务未能就绪。'}
     & $dotnet run --project (Join-Path $repoRoot 'tools\Checks\Checks.csproj') -c Release --no-build -- $repoRoot
     if($LASTEXITCODE -ne 0){throw '游戏桥接与寻路检查失败。'}
-    & $dotnet run --project (Join-Path $repoRoot 'tools\CoreChecks\CoreChecks.csproj') -c Release --no-build -- $repoRoot
-    if($LASTEXITCODE -ne 0){throw 'Agent、权限及记忆检查失败。'}
-    & $dotnet run --project (Join-Path $repoRoot 'src\StardewMiningAgent.Verification\StardewMiningAgent.Verification.csproj') -c Release --no-build
-    if($LASTEXITCODE -ne 0){throw 'MiningAgent算法验证失败。'}
+    & (Join-Path $PSScriptRoot 'run-core-checks.ps1') -DotnetPath $dotnet -NoBuild
     Write-Host '统一自动检查全部通过。该命令不替代双开实机验收。' -ForegroundColor Green
 }finally{
     if($server -and -not $server.HasExited){Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue}

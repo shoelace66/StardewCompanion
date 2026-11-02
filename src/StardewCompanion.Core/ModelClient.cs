@@ -14,10 +14,10 @@ public sealed class ModelClient(HttpClient http)
     {
         var body=new JsonObject { ["model"]=settings.Model,["messages"]=messages.DeepClone(),["tools"]=(toolOverrides??ToolCatalog.Definitions(soloTest,capabilities)).DeepClone(),["tool_choice"]=toolChoice?.DeepClone()??JsonValue.Create("auto"),["stream"]=false,["max_tokens"]=2400 };
         var payload=body.ToJsonString();
-        capture?.Invoke(body);
         var timer=Stopwatch.StartNew();
         for(var attempt=0;;attempt++){
         try{
+        capture?.Invoke(body);
         using var request=new HttpRequestMessage(HttpMethod.Post,settings.ValidateEndpoint());
         request.Headers.Authorization=new AuthenticationHeaderValue("Bearer",settings.GetKey());
         request.Content=new StringContent(payload,System.Text.Encoding.UTF8,"application/json");
@@ -138,6 +138,7 @@ public static class ToolCatalog
                 props["direction"]!["enum"]=new JsonArray("up","right","down","left");props["treasurePolicy"]!["enum"]=new JsonArray("try","ignore");
             }
             if(name=="fight_enemies"){props["maxKills"]!["minimum"]=1;props["maxKills"]!["maximum"]=30;props["maxGameMinutes"]!["minimum"]=1;props["maxGameMinutes"]!["maximum"]=600;}
+            if(name is "deposit_items" or "withdraw_items"){props["count"]!["minimum"]=1;props["count"]!["maximum"]=9999;}
             if(name=="read_context_history"){props["source"]!["enum"]=new JsonArray("plans","memory","receipts","diagnostics");props["offset"]!["minimum"]=0;props["limit"]!["minimum"]=1;props["limit"]!["maximum"]=8;}
         }
         return a;
@@ -177,6 +178,8 @@ public static class ToolCatalog
             parameters["pending"]!["maxItems"]=8;
         }
         tools.Add(Tool("wait_for_change","没有有效工作时等待状态变化或到期",("seconds","integer","1到120秒"),("reason","string","明确等待什么条件")));
+        tools.Last()!["function"]!["parameters"]!["properties"]!["seconds"]!["minimum"]=1;
+        tools.Last()!["function"]!["parameters"]!["properties"]!["seconds"]!["maximum"]=120;
         tools.Add(new JsonObject{["type"]="function",["function"]=new JsonObject{["name"]="inspect_targets",["description"]="一次检查当前地图1到32格，避免逐格模型往返",
             ["parameters"]=new JsonObject{["type"]="object",["properties"]=new JsonObject{["tiles"]=new JsonObject{["type"]="array",["minItems"]=1,["maxItems"]=32,["items"]=new JsonObject{["type"]="object",["properties"]=new JsonObject{["x"]=Field("integer","tile coordinate"),["y"]=Field("integer","tile coordinate")},["required"]=new JsonArray("x","y"),["additionalProperties"]=false}}},["required"]=new JsonArray("tiles"),["additionalProperties"]=false}}});
         return tools;

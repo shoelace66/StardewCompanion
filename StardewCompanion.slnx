@@ -13,5 +13,6 @@
     <Project Path="tools/Checks/Checks.csproj" />
     <Project Path="tools/CoreChecks/CoreChecks.csproj" />
     <Project Path="tools/Fixture/Fixture.csproj" />
+    <Project Path="tools/ToolChecks/ToolChecks.csproj" />
   </Folder>
 </Solution>

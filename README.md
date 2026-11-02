@@ -291,6 +291,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/publish-windows.ps1 `
 
 ## 检查与实机验收
 
+未安装游戏的贡献者可先运行核心与工具检查。需要 Windows 和 `global.json` 对应的 .NET SDK；脚本优先使用 `.tools/dotnet/dotnet.exe`，否则使用 PATH 中的 `dotnet`：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-core-checks.ps1
+```
+
+该入口构建并运行工具契约、Agent/权限/记忆、上下文、短计划、事件反馈、季节工具和算法回归。模型与游戏桥接使用本地替身，不需要游戏程序集、真实 API 密钥或固定诊断端口。工具契约报告保存在 `.local/checks/tool-contracts.json`；报告中的工具数量不代表实机验收数量。GitHub Actions 在 Windows 上运行同一入口，并额外编译桌面端和诊断服务。
+
 统一构建与自动检查命令：
 
 ```powershell
@@ -298,7 +306,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-checks.ps1 `
   -GamePath 'F:\SteamLibrary\steamapps\common\Stardew Valley'
 ```
 
-该脚本会构建解决方案并运行桥接、输入/寻路、Agent、权限/记忆和算法验证。执行前需要退出正在运行的 SMAPI AI 客户端，并释放本机诊断端口 `27841`。检查需要本地 SDK 和游戏程序集；自动化通过不能替代游戏内联机验证。
+该脚本会构建完整解决方案，运行桥接、输入/寻路检查，再调用上述核心与工具检查入口。执行前需要退出正在运行的 SMAPI AI 客户端，并释放本机诊断端口 `27841`。完整检查需要本地 SDK 和游戏程序集；自动化通过不能替代游戏内联机验证。
 
 可选的真实 API 连通检查会发出一次真实模型请求，需已配置 API 密钥：
 
@@ -321,7 +329,7 @@ dotnet run --project tools/CoreChecks -c Release -- D:\code\sw --live
 
 - `complete_public_project` 尚缺各项目专用预算与提交适配器，当前不作为可用能力提供；部分活动小游戏及非物品递送类任务仍未完成适配。
 - 料理、畜牧、工具升级、建筑及献祭等中后期成功路径尚未完成本轮实机验收；不能将编译通过或工具注册视为全部功能通过。
-- 新增 `tools/ToolChecks` 用于工具目录、八类分组、十个高频入口和参数契约检查；现有部分旧检查仍针对旧工具结构，需要同步后再用于整体验收。
+- `tools/ToolChecks` 已接入解决方案、统一检查与无需游戏的检查入口，覆盖工具目录、八类分组、十个高频入口和参数契约；短计划及事件反馈回归使用当前 `group_*` 接口。实机能力仍须按原生回执逐项验收。
 - 项目尚未达到完整正式发布验收。当前通过的自动检查和指定存档实测，不证明所有版本组合、网络环境或长期无人干预任务都可靠。
 - 2026-10-29 的一轮真实 LLM 农务、采集、归仓和睡觉流程中曾因观察缺少作物死亡状态而暂停、修复并重连后继续；这是人工介入后的试运行。
 - 此前联机换日曾停在原版同步屏障等待。之后有成功换日记录，但旧问题根因仍未确认，不能据此断言已彻底解决。

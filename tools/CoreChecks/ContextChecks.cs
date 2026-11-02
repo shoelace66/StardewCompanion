@@ -117,7 +117,7 @@ internal static class ContextChecks
         await runtime.Pause();
         Check(model.Requests.Count==2,"context compression and historical retrieval need no separate model summarization request");
         var second=model.Requests[1];var messages=second["messages"]!.AsArray();var context=JsonNode.Parse(messages[1]!["content"]!.GetValue<string>())!;
-        Check(context["observation"]!["world"]!["money"]!.GetValue<int>()==999,"observe refreshes the one current snapshot during tool-call follow-up");
+        Check(context["world"]!["money"]!.GetValue<int>()==999,"observe refreshes the one current snapshot during tool-call follow-up");
         var observeReply=JsonNode.Parse(messages.Last()!["content"]!.GetValue<string>())!;
         Check(observeReply["observationUpdated"]!.GetValue<bool>()&&observeReply["data"]==null,"observe tool response references the updated snapshot without retransmitting it");
         var history=JsonNode.Parse(messages[messages.Count-2]!["content"]!.GetValue<string>())!;

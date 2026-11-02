@@ -10,7 +10,7 @@ internal static class PlanChecks
     internal static async Task Run(string folder)
     {
         static void Check(bool ok,string name){if(!ok)throw new Exception("FAIL: "+name);Console.WriteLine("PASS: "+name);}
-        static void Reject(JsonObject args){try{ShortPlan.Parse(args,true);}catch(InvalidOperationException){return;}throw new Exception("Invalid plan was accepted");}
+        static void Reject(JsonObject args){try{ShortPlan.Parse(args);}catch(InvalidOperationException){return;}throw new Exception("Invalid plan was accepted");}
         static JsonObject Args(int count)=>new(){["planId"]="test-plan",["steps"]=new JsonArray(Enumerable.Range(0,count).Select(i=>(JsonNode)new JsonObject{["skill"]="go_to",["arguments"]=new JsonObject{["location"]="Farm",["x"]=i+1,["y"]=15}}).ToArray())};
         Reject(Args(9));
         var invalid=Args(2);invalid["steps"]![0]!["skill"]="sleep";invalid["steps"]![0]!["arguments"]=new JsonObject();Reject(invalid);
@@ -18,12 +18,13 @@ internal static class PlanChecks
         invalid=Args(1);invalid["steps"]![0]!["skill"]="plant_area";invalid["steps"]![0]!["arguments"]=new JsonObject{["location"]="Farm",["x"]=1,["y"]=1,["width"]=1,["height"]=1};Reject(invalid);
         Check(true,"short plans reject >8 steps, nonfinal sleep, missing coordinates and unspecified seed before execution");
         var fishingPlan=new JsonObject{["planId"]="fish-plan",["encounterPolicy"]="avoid",["steps"]=new JsonArray(new JsonObject{["skill"]="fish_at",["arguments"]=new JsonObject{["location"]="Beach",["x"]=10,["y"]=10,["direction"]="right",["casts"]=3,["treasurePolicy"]="ignore"}})};
-        Check(ShortPlan.Parse(fishingPlan,false).EncounterPolicy=="avoid"&&ShortPlan.Parse(fishingPlan,false).Steps[0].Skill=="fish_at","fish_at and explicit encounter policy pass the production short-plan parser");
+        Check(ShortPlan.Parse(fishingPlan).EncounterPolicy=="avoid"&&ShortPlan.Parse(fishingPlan).Steps[0].Skill=="fish_at","fish_at and explicit encounter policy pass the production short-plan parser");
         fishingPlan["encounterPolicy"]="invented";Reject(fishingPlan);
         var combatPlan=new JsonObject{["planId"]="combat-plan",["steps"]=new JsonArray(new JsonObject{["skill"]="fight_enemies",["arguments"]=new JsonObject{["maxKills"]=2,["maxGameMinutes"]=30,["weaponId"]="(W)0"}})};
-        Check(ShortPlan.Parse(combatPlan,false).EncounterPolicy=="interrupt","old short plans default encounter policy to interrupt and combat parameters validate");
+        Check(ShortPlan.Parse(combatPlan).EncounterPolicy=="interrupt","short plans default encounter policy to interrupt and combat parameters validate");
         var minePlan=new JsonObject{["planId"]="mine-plan",["steps"]=new JsonArray(new JsonObject{["skill"]="mine_travel",["arguments"]=new JsonObject{["targetFloor"]=5}})};
-        Check(ShortPlan.Parse(minePlan,false).Steps[0].Skill=="mine_travel","ordinary mine travel passes the production short-plan parser");
+        try{PermissionPolicy.Authorize("mine_travel",minePlan["steps"]![0]!["arguments"]!.AsObject(),Array.Empty<ChestBinding>(),new(){WorldReady=true});throw new Exception("Disabled mine travel was authorized");}
+        catch(InvalidOperationException){Check(true,"mine travel remains disabled at the permission boundary");}
         using(var db=new MemoryStore(Path.Combine(folder,"persistent-instructions.db"))){
             db.AppendPlayerInstruction("a","five days; no fishing");
             for(var i=0;i<30;i++)db.Chat("a","assistant","intention only");
@@ -32,10 +33,10 @@ internal static class PlanChecks
         using(var db=new MemoryStore(Path.Combine(folder,"persistent-instructions.db")))
             Check(db.PlayerInstructions("a").Single().Contains("no fishing"),"objective survives application restart");
         var treeArgs=Args(1);treeArgs["steps"]![0]!["skill"]="clear_area";treeArgs["steps"]![0]!["arguments"]=new JsonObject{["location"]="Farm",["x"]=10,["y"]=10,["width"]=3,["height"]=3,["targetType"]="tree",["removeStumps"]=false};
-        Check(ShortPlan.Parse(treeArgs,true).Steps[0].Arguments["targetType"]!.GetValue<string>()=="tree","mature trees are reachable through the actual model plan schema with explicit stump policy");
+        Check(ShortPlan.Parse(treeArgs).Steps[0].Arguments["targetType"]!.GetValue<string>()=="tree","mature trees are reachable through the actual model plan schema with explicit stump policy");
         treeArgs["steps"]![0]!["arguments"]!["removeStumps"]="false";Reject(treeArgs);
         treeArgs["steps"]![0]!["arguments"]!["removeStumps"]=false;treeArgs["steps"]![0]!["arguments"]!["targetType"]="debris";
-        Check(ShortPlan.Parse(treeArgs,true).Steps.Length==1,"debris clearing policy is accepted by the primitive schema");
+        Check(ShortPlan.Parse(treeArgs).Steps.Length==1,"debris clearing policy is accepted by the primitive schema");
         Check(ControlModePolicy.CanControl(new(){WorldReady=true,IsHost=true,ControlMode="solo_test",Multiplayer=false,PlayerName="SC5Host",TestRunId="SC10D_check"}),"ten-day run naming preserves explicit isolated host control");
         foreach(var scenario in new[]{"eight","failure","pause","low_stamina_late","save_then_execute","invalid_json"}){
             var bridge=new PlanBridge(scenario);
@@ -60,7 +61,7 @@ internal static class PlanChecks
                 await Task.Delay(700);
                 Check(handler.Requests>=2,"plan completion wakes the next decision without twenty-second delay");
                 Check(bridge.Commands.Count==8,"duplicate plan id is not executed a second time");
-                if(scenario=="save_then_execute")Check(runtime.Plans.Single().Revision>=2,"saving a public plan allows execute_plan in the same model response");
+                if(scenario=="save_then_execute")Check(runtime.Plans.Single().Revision>=2,"saving a public plan allows a group tool in the same model response");
                 if(scenario=="invalid_json")Check(handler.Requests>=2&&runtime.Decisions.Read().Any(e=>e.Kind=="tool_rejected")&&!runtime.Decisions.Read().Any(e=>e.Kind=="model_error"),"malformed arguments are returned to the model for correction without a global one-minute failure cooldown");
             }else Check(bridge.Commands.Count==2,"failed step stops all remaining steps");
             if(scenario=="low_stamina_late"){
@@ -82,7 +83,7 @@ internal static class PlanChecks
         var state=new GameObservation{Location="Farm",Tile=new(){X=0,Y=0},WorldView="""{"soil":[{"x":8,"y":8,"dead":false,"needsWater":true},{"x":1,"y":1,"dead":false,"ready":true}],"forage":[{"x":0,"y":1}]}"""};
         Check(JsonSerializer.Serialize(GreedyCandidates.Read(state)[0]).Contains("water_area"),"greedy ranking protects existing crops before nearby optional gains");
         var tools=ToolCatalog.Definitions(true);
-        Check(tools.Any(t=>t!["function"]!["name"]!.GetValue<string>()=="execute_plan")&&!tools.Any(t=>t!["function"]!["name"]!.GetValue<string>()=="plant_area"),"model sees one explicit plan interface instead of competing primitive mutation interfaces");
+        Check(!tools.Any(t=>t!["function"]!["name"]!.GetValue<string>()=="execute_plan")&&tools.Count(t=>t!["function"]!["name"]!.GetValue<string>().StartsWith("group_"))==8&&tools.Any(t=>t!["function"]!["name"]!.GetValue<string>()=="plant_area"),"model sees eight group tools and the frequent direct tools without the retired execute_plan interface");
     }
     private sealed class PlanModel(JsonObject args,PlanBridge bridge):HttpMessageHandler
     {
@@ -92,7 +93,8 @@ internal static class PlanChecks
             Requests++;
             var calls=new List<object>();
             if(bridge.Scenario=="save_then_execute")calls.Add(new{id="save",type="function",function=new{name="save_plan",arguments=JsonSerializer.Serialize(new{planId="test-plan",goal="reach declared targets",basis="observed state",assumptions=Array.Empty<string>(),successCriteria=new[]{"actual receipts"},pending=Array.Empty<string>()})}});
-            calls.Add(new{id="plan",type="function",function=new{name="execute_plan",arguments=bridge.Scenario=="invalid_json"&&Requests==1?"{\"planId\": 未引用}":args.ToJsonString()}});
+            var skill=args["steps"]![0]!["skill"]!.GetValue<string>();
+            calls.Add(new{id="plan",type="function",function=new{name="group_"+BusinessCapabilities.GroupFor(skill),arguments=bridge.Scenario=="invalid_json"&&Requests==1?"{\"planId\": 未引用}":args.ToJsonString()}});
             var response=new{choices=new[]{new{message=new{role="assistant",content="",tool_calls=calls}}}};
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(response))});
         }

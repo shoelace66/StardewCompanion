@@ -11,6 +11,7 @@ using StardewCompanion.Fishing;
 
 var root=Path.GetFullPath(args.FirstOrDefault()??".");
 if(args.Contains("--awareness")){await AwarenessChecks.Run(Path.Combine(root,".local","checks","awareness-"+DateTime.UtcNow.ToString("yyyyMMddHHmmss")));return;}
+if(args.Contains("--season-tools")){await SeasonToolChecks.Run(Path.Combine(root,".local","checks",Guid.NewGuid().ToString("N")));return;}
 if(args.Contains("--live"))
 {
     var settings=ModelSettings.Load(Path.Combine(root,".local","model.credentials.json"));
@@ -66,10 +67,11 @@ soloState.ControlMode="solo_test";soloState.TestRunId="SC5D_check";soloState.Pla
 Assert(ControlModePolicy.CanControl(soloState),"explicit isolated solo test host can be controlled");
 soloState.Multiplayer=true;Assert(!ControlModePolicy.CanControl(soloState),"solo test opt-in cannot authorize a multiplayer host");
 soloState.Multiplayer=false;soloState.TestRunId="real-farm";Assert(!ControlModePolicy.CanControl(soloState),"normal saves cannot be opted into solo test control");
-var authorized=PermissionPolicy.Authorize("deposit_items",new JsonObject{["chest"]="工作箱",["itemId"]="(O)388",["count"]=2,["chestId"]="forged"},new[]{chest},observation);
-Assert(authorized["chestId"]!.GetValue<string>()=="bound","model cannot forge chest binding");
+Reject(()=>PermissionPolicy.Authorize("deposit_items",new JsonObject{["chest"]="工作箱",["itemId"]="(O)388",["count"]=2,["chestId"]="forged"},new[]{chest},observation),"model cannot inject an internal chest binding");
+var authorized=PermissionPolicy.Authorize("deposit_items",new JsonObject{["chest"]="工作箱",["itemId"]="(O)388",["count"]=2},new[]{chest},observation);
+Assert(authorized["chestId"]!.GetValue<string>()=="bound","authorized chest name resolves to the player binding");
 Reject(()=>PermissionPolicy.Authorize("withdraw_items",new JsonObject{["chest"]="工作箱",["itemId"]="(T)Axe",["count"]=1},new[]{chest},observation),"tool protection overrides allowlist");
-Reject(()=>PermissionPolicy.Authorize("sell_items",new(),new[]{chest},observation),"unimplemented world-changing skill rejected");
+Reject(()=>PermissionPolicy.Authorize("sell_items",new(),new[]{chest},observation),"business mutation with missing required arguments rejected");
 
 var builder=WebApplication.CreateBuilder();builder.Logging.ClearProviders();builder.WebHost.UseUrls("http://127.0.0.1:0");
 await using var server=builder.Build();
@@ -91,12 +93,16 @@ var scenarioProject="";
 server.MapPost("/scenario",async context=>
 {
     var body=(await JsonNode.ParseAsync(context.Request.Body))!;scenarioRequests.Enqueue(body);
-    var input=JsonNode.Parse(body["messages"]!.AsArray().Last()!["content"]!.GetValue<string>())!;
+    var input=JsonNode.Parse(body["messages"]!.AsArray().First(m=>m?["role"]?.GetValue<string>()=="user")!["content"]!.GetValue<string>())!;
     var calls=new JsonArray();
-    if(input["instruction"]!.GetValue<string>()=="关联项目后切换任务")
+    if(input["conversation"]?["newMessages"]?.AsArray().Any(m=>m?["text"]?.GetValue<string>()=="关联项目后切换任务")==true)
     {
+        if(!body["tools"]!.AsArray().Any(t=>t?["function"]?["name"]?.GetValue<string>()=="update_project"))
+            calls.Add(new JsonObject{["id"]="expand",["type"]="function",["function"]=new JsonObject{["name"]="list_capabilities",["arguments"]="{}"}});
+        else {
         calls.Add(new JsonObject{["id"]="project",["type"]="function",["function"]=new JsonObject{["name"]="update_project",["arguments"]=JsonSerializer.Serialize(new{projectId=scenarioProject,nextStep="走到农场入口"})}});
         calls.Add(new JsonObject{["id"]="travel",["type"]="function",["function"]=new JsonObject{["name"]="go_to",["arguments"]="{\"location\":\"Farm\",\"x\":1,\"y\":2}"}});
+        }
     }
     await context.Response.WriteAsJsonAsync(new JsonObject{["choices"]=new JsonArray(new JsonObject{["message"]=new JsonObject{["role"]="assistant",["content"]="",["tool_calls"]=calls}})});
 });
@@ -149,11 +155,13 @@ await using(var isolated=new CompanionRuntime(isolatedBridge,new MemoryStore(Pat
     isolatedBridge.Observe(observation);isolated.SendMessage("旧存档不能带入的新指令");
     var other=JsonSerializer.Deserialize<GameObservation>(JsonSerializer.Serialize(observation))!;other.SessionId="another-session";other.SaveId="another-save";
     isolatedBridge.Observe(other);isolated.Start();await Task.Delay(400);
-    Assert(!scenarioRequests.Any(body=>JsonNode.Parse(body["messages"]!.AsArray().Last(m=>m?["role"]?.GetValue<string>()=="user")!["content"]!.GetValue<string>())?["instruction"]?.GetValue<string>()=="旧存档不能带入的新指令"),"queued player instructions are discarded when save or session changes");
+    Assert(!scenarioRequests.Any(body=>body["messages"]!.AsArray().Any(m=>m?["role"]?.GetValue<string>()=="user"&&m["content"]!.GetValue<string>().Contains("旧存档不能带入的新指令"))),"queued player instructions are discarded when save or session changes");
     Assert(isolated.Memory.History("save:2").Single().Text=="旧存档不能带入的新指令"&&isolated.Memory.History("another-save:2").Count==0,"discarded instructions remain only in their original save's chat history");
 }
 await ContextChecks.Run(root,folder);
 await PlanChecks.Run(folder);
+await AwarenessChecks.Run(Path.Combine(folder,"awareness"));
+await SeasonToolChecks.Run(folder);
 await server.StopAsync();
 Console.WriteLine("All core checks passed; live game behavior is tested separately.");
 

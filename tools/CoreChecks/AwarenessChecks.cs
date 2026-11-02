@@ -19,10 +19,10 @@ internal static class AwarenessChecks
             bridge.Publish();runtime.Start();await runtime.Resume();runtime.SendMessage("采黄水仙然后回家睡觉");
             await Until(()=>model.Requests.Count>=3,"failure and duplicate rejection both trigger a new model request");
             await runtime.Pause();
-            var requests=model.Requests.ToArray();var feedback=Context(requests[1])["actionFeedback"]!.ToJsonString();
-            Check(feedback.Contains("inventory_full")&&feedback.Contains("return_home")&&feedback.Contains("sleep"),"next actual request contains full-bag failure and unexecuted return-home/sleep steps");
-            Check(Context(requests[2])["actionFeedback"]!.ToJsonString().Contains("unchanged_target_previously_failed")&&Context(requests[2])["actionFeedback"]!.ToJsonString().Contains("inventory_full"),"duplicate target rejection retains the original inventory_full reason");
-            Check(bridge.Commands.Count==1&&bridge.Commands.Single()=="forage_area","failed forage never executes dependent return-home/sleep steps or repeats the actual failed action");
+            var requests=model.Requests.ToArray();var feedback=Context(requests[1])["agentState"]!.ToJsonString();
+            Check(feedback.Contains("inventory_full")&&feedback.Contains("forage_area")&&feedback.Contains("52"),"next actual request contains full-bag failure and the unexecuted same-group forage target");
+            Check(Context(requests[2])["agentState"]!.ToJsonString().Contains("unchanged_target_previously_failed")&&Context(requests[2])["agentState"]!.ToJsonString().Contains("inventory_full"),"duplicate target rejection retains the original inventory_full reason");
+            Check(bridge.Commands.Count==1&&bridge.Commands.Single()=="forage_area","failed forage never executes dependent steps or repeats the actual failed action");
             Check(runtime.AwarenessSnapshot()["actionFeedback"]!["blockers"]!.AsArray().Count==1,"task and plan summaries merge into one unresolved blocker");
             bridge.FreeSlots=1;bridge.Publish();
             Check(runtime.AwarenessSnapshot()["actionFeedback"]!["blockers"]!.AsArray().Count==0,"freeing a backpack slot resolves the inventory blocker");
@@ -61,8 +61,8 @@ internal static class AwarenessChecks
         {
             Requests.Enqueue(JsonNode.Parse(await request.Content!.ReadAsStringAsync(ct))!.AsObject());
             if(Fail)return new(HttpStatusCode.ServiceUnavailable){Content=new StringContent("unavailable")};
-            var n=Requests.Count;var name=n<=2?"execute_plan":"wait_for_change";
-            object args=n<=2?new{planId="forage-"+n,goal="采黄水仙后返家睡觉",basis="visible flower",assumptions=Array.Empty<string>(),successCriteria=new[]{"actual pickup"},pending=Array.Empty<string>(),steps=new[]{new{skill="forage_area",arguments=(object)new{location="Town",x=51,y=31,width=1,height=1}},new{skill="return_home",arguments=(object)new{}},new{skill="sleep",arguments=(object)new{}}}}:new{seconds=120,reason="验证后等待"};
+            var n=Requests.Count;var name=n<=2?"group_resources_exploration":"wait_for_change";
+            object args=n<=2?new{planId="forage-"+n,goal="依次采集两个已观察目标",basis="visible flowers",assumptions=Array.Empty<string>(),successCriteria=new[]{"actual pickup"},pending=Array.Empty<string>(),steps=new[]{new{skill="forage_area",arguments=new{location="Town",x=51,y=31,width=1,height=1}},new{skill="forage_area",arguments=new{location="Town",x=52,y=31,width=1,height=1}}}}:new{seconds=120,reason="验证后等待"};
             return new(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(new{choices=new[]{new{message=new{role="assistant",content="",tool_calls=new[]{new{id="call-"+n,type="function",function=new{name,arguments=JsonSerializer.Serialize(args)}}}}}}}))};
         }
     }

@@ -279,15 +279,6 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                     var rawArguments=call?["function"]?["arguments"]?.GetValue<string>()??"{}";
                     JsonObject arguments;
                     try{arguments=JsonNode.Parse(rawArguments) as JsonObject??throw new JsonException("Expected a JSON object");}
-                    catch(JsonException){arguments=new JsonObject();}
-                    if(seasonMaintenance&&name is "update_season_progress" or "create_season_plan"){
-                        object seasonResult;
-                        try{seasonResult=name=="update_season_progress"?UpdateSeasonProgress(arguments):CreateSeasonPlan(arguments,state);}
-                        catch(Exception ex){seasonResult=new{status="rejected",reason=SafeError(ex)};}
-                        messages.Add(new JsonObject{["role"]="tool",["tool_call_id"]=call!["id"]!.GetValue<string>(),["content"]=DecisionContextCompression.Serialize(seasonResult)});
-                        continue;
-                    }
-                    try{arguments=JsonNode.Parse(rawArguments) as JsonObject??throw new JsonException("Expected a JSON object");}
                     catch(JsonException ex){
                         var invalid=new{status="rejected",reason="invalid_tool_arguments_json",line=ex.LineNumber,column=ex.BytePositionInLine,
                             correction="工具arguments必须是合法JSON对象；中文文本须使用双引号，assumptions、successCriteria、pending必须是字符串数组；请修正后重试，本次没有执行该工具"};
@@ -302,7 +293,10 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                         if(!promptTools.Any(t=>t?["function"]?["name"]?.ToString()==name))throw new InvalidOperationException("tool_not_in_current_scope:"+name);
                         using(var schema=JsonDocument.Parse(promptTools.First(t=>t?["function"]?["name"]?.ToString()==name)!["function"]!["parameters"]!.ToJsonString()))
                         using(var value=JsonDocument.Parse(arguments.ToJsonString()))ContractValidation.ValidateSchema(schema.RootElement,value.RootElement,name);
-                        if(name=="save_plan"){
+                        if(seasonMaintenance){
+                            result=name=="update_season_progress"?UpdateSeasonProgress(arguments):CreateSeasonPlan(arguments,state);
+                        }
+                        else if(name=="save_plan"){
                             result=SaveWorkPlan(arguments);
                             if(Mode=="plan_only"){_decisionDue=Environment.TickCount64+120000;mutation=true;}
                         }

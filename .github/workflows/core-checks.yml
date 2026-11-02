@@ -1,0 +1,36 @@
+name: Core and tool checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  core-checks:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Check tools, Agent runtime and algorithms without game files
+        shell: pwsh
+        run: ./tools/run-core-checks.ps1
+      - name: Build desktop and diagnostics
+        shell: pwsh
+        run: |
+          dotnet build src/StardewCompanion.Desktop/StardewCompanion.Desktop.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet build src/StardewCompanion.Diagnostics/StardewCompanion.Diagnostics.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload tool contract report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tool-contracts
+          path: .local/checks/tool-contracts.json
+          include-hidden-files: true
+          if-no-files-found: ignore

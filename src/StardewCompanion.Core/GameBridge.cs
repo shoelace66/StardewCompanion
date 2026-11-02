@@ -32,6 +32,8 @@ public sealed class GameBridge : IGameBridge, IAsyncDisposable
     private readonly ConcurrentDictionary<string, bool> _terminalOnly = new();
     private readonly ConcurrentQueue<TaskResult> _results = new();
     private readonly object _connectionGate = new();
+    private readonly SemaphoreSlim _lifecycle = new(1);
+    private bool _disposed;
     private CompanionRuntime? _agent;
     public void AttachAgent(CompanionRuntime runtime)=>_agent=runtime;
     public GameObservation? Observation { get; private set; }
@@ -44,12 +46,29 @@ public sealed class GameBridge : IGameBridge, IAsyncDisposable
     public string Token { get; private set; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
     public async Task Start(string sessionFile, int port = 27841)
     {
+        await _lifecycle.WaitAsync();
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_app != null) throw new InvalidOperationException("本地服务已经启动。");
+            try { await StartCore(sessionFile, port); }
+            catch
+            {
+                var failed = _app; _app = null; Endpoint = "";
+                if (failed != null) await failed.DisposeAsync();
+                throw;
+            }
+        }
+        finally { _lifecycle.Release(); }
+    }
+    private async Task StartCore(string sessionFile, int port)
+    {
         // Keep an already running game able to reconnect after its frontend restarts.
         if(File.Exists(sessionFile)){
             try{
                 using var previous=JsonDocument.Parse(File.ReadAllText(sessionFile));
                 var root=previous.RootElement;
-                if(root.TryGetProperty("endpoint",out var endpoint)&&endpoint.GetString()==$"ws://127.0.0.1:{port}/bridge"
+                if(root.ValueKind==JsonValueKind.Object&&root.TryGetProperty("endpoint",out var endpoint)&&endpoint.ValueKind==JsonValueKind.String&&endpoint.GetString()==$"ws://127.0.0.1:{port}/bridge"
                     &&root.TryGetProperty("token",out var token)&&token.ValueKind==JsonValueKind.String
                     &&token.GetString() is {Length:64} value&&value.All(Uri.IsHexDigit))Token=value;
             }
@@ -113,8 +132,7 @@ public sealed class GameBridge : IGameBridge, IAsyncDisposable
             await Send("task",command); return Results.Accepted(value:new {command.TaskId});
         });
         await _app.StartAsync(); Endpoint=$"ws://127.0.0.1:{port}/bridge";
-        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(sessionFile))!);
-        File.WriteAllText(sessionFile,JsonSerializer.Serialize(new {endpoint=Endpoint,token=Token}));
+        AtomicFile.WriteAllText(sessionFile,JsonSerializer.Serialize(new {endpoint=Endpoint,token=Token}));
     }
     private static TaskCommand Command(GameObservation state,string skill,object arguments,string? taskId=null,string encounterPolicy="interrupt") => new()
     {TaskId=taskId??Guid.NewGuid().ToString("N"),SessionId=state.SessionId,SaveId=state.SaveId,PlayerId=state.PlayerId,ObservationRevision=state.Revision,ExpiresAtUtcMs=DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()+5000,Skill=skill,Arguments=JsonSerializer.Serialize(arguments),EncounterPolicy=encounterPolicy};
@@ -193,7 +211,23 @@ public sealed class GameBridge : IGameBridge, IAsyncDisposable
         finally{_writer.Release();}
     }
     public async ValueTask DisposeAsync()
-    {try{await Control("pause");}catch{} _socket?.Abort();if(_app!=null)await _app.DisposeAsync();}
+    {
+        await _lifecycle.WaitAsync();
+        try
+        {
+            if (_disposed) return;
+            _disposed = true;
+            try { await Control("pause"); }
+            catch (Exception ex) when (ex is WebSocketException or IOException or OperationCanceledException) { }
+            finally
+            {
+                _socket?.Abort();
+                try { if (_app != null) await _app.DisposeAsync(); }
+                finally { _app = null; _agent = null; Endpoint = ""; Observation = null; }
+            }
+        }
+        finally { _lifecycle.Release(); }
+    }
 }
 public sealed record BridgeTask(string Skill,JsonElement Arguments,string? TaskId);
   public sealed record AgentMode(string Mode);

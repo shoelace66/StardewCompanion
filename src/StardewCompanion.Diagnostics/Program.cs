@@ -3,6 +3,8 @@
 await using var bridge=new GameBridge();
 CompanionRuntime? agent=null;
 using var http=new HttpClient{Timeout=TimeSpan.FromSeconds(55)};
+try
+{
 if(args.Contains("--agent"))
 {
     var data=Path.GetFullPath(Environment.GetEnvironmentVariable("SC_AGENT_DATA")??".local/agent-run");
@@ -23,4 +25,5 @@ agent?.Start();
 var stopped=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 Console.CancelKeyPress+=(_,e)=>{e.Cancel=true;stopped.TrySetResult();};
 await stopped.Task;
-if(agent!=null)await agent.DisposeAsync();
+}
+finally { if(agent!=null)await agent.DisposeAsync(); }

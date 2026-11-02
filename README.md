@@ -308,6 +308,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-checks.ps1 `
 
 该脚本会构建完整解决方案，运行桥接、输入/寻路检查，再调用上述核心与工具检查入口。执行前需要退出正在运行的 SMAPI AI 客户端，并释放本机诊断端口 `27841`。完整检查需要本地 SDK 和游戏程序集；自动化通过不能替代游戏内联机验证。
 
+应用启动与恢复检查可在 Windows 上独立运行，不需要游戏文件或 API 密钥。`AppChecks` 验证设置保存、会话重连和资源清理；`DesktopChecks` 使用隐藏的真实 WPF 窗口验证损坏配置、失败重试与退出。桌面检查需要 `27841` 空闲，会拒绝占用其他实例的端口：
+
+```powershell
+dotnet run --project tools/AppChecks -c Release -- .
+dotnet run --project tools/DesktopChecks -c Release -- .
+```
+
+这两项也已加入统一检查和 `Application lifecycle checks` Windows CI；数据写入 `.local/checks` 下独立的临时目录。
+
 可选的真实 API 连通检查会发出一次真实模型请求，需已配置 API 密钥：
 
 ```powershell

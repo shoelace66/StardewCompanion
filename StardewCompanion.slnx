@@ -10,8 +10,10 @@
     <Project Path="src/StardewCompanion.Protocol/StardewCompanion.Protocol.csproj" />
   </Folder>
   <Folder Name="/tools/">
+    <Project Path="tools/AppChecks/AppChecks.csproj" />
     <Project Path="tools/Checks/Checks.csproj" />
     <Project Path="tools/CoreChecks/CoreChecks.csproj" />
+    <Project Path="tools/DesktopChecks/DesktopChecks.csproj" />
     <Project Path="tools/Fixture/Fixture.csproj" />
     <Project Path="tools/ToolChecks/ToolChecks.csproj" />
   </Folder>

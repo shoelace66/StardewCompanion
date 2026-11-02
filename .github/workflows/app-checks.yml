@@ -1,0 +1,27 @@
+name: Application lifecycle checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  app-checks:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Check settings, startup and shutdown without game files
+        shell: pwsh
+        run: dotnet run --project tools/AppChecks/AppChecks.csproj -c Release -- .
+      - name: Check WPF startup, recovery and closing
+        shell: pwsh
+        run: dotnet run --project tools/DesktopChecks/DesktopChecks.csproj -c Release -- .
+      - name: Build diagnostics
+        shell: pwsh
+        run: dotnet build src/StardewCompanion.Diagnostics/StardewCompanion.Diagnostics.csproj -c Release

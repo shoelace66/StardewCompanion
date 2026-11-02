@@ -10,8 +10,31 @@ public sealed class ModelSettings
     public string Model { get; set; } = "deepseek-chat";
     public string ApiKeyDpapi { get; set; } = "";
     public string GamePath { get; set; } = @"F:\SteamLibrary\steamapps\common\Stardew Valley";
-    public static ModelSettings Load(string path) => File.Exists(path) ? JsonSerializer.Deserialize<ModelSettings>(File.ReadAllText(path), new JsonSerializerOptions { PropertyNameCaseInsensitive = true })! : new();
-    public void Save(string path) { Directory.CreateDirectory(Path.GetDirectoryName(path)!); File.WriteAllText(path, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true })); }
+    public static ModelSettings Load(string path)
+    {
+        if (!File.Exists(path)) return new();
+        var settings = JsonSerializer.Deserialize<ModelSettings>(File.ReadAllText(path), new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        if (settings == null || settings.Endpoint == null || settings.Model == null || settings.ApiKeyDpapi == null || settings.GamePath == null)
+            throw new JsonException("设置必须是 JSON 对象，且设置字段不能为 null。");
+        return settings;
+    }
+    public static ModelSettings LoadForEditing(string path, out string? recoveryFile)
+    {
+        recoveryFile = null;
+        try { return Load(path); }
+        catch (JsonException)
+        {
+            // Preserve the original bytes before allowing the UI to save replacement settings.
+            recoveryFile = Path.GetFullPath(path) + ".invalid-" + Guid.NewGuid().ToString("N") + ".bak";
+            File.Copy(path, recoveryFile);
+            return new();
+        }
+    }
+    public void Save(string path)
+    {
+        ValidateEndpoint();
+        AtomicFile.WriteAllText(path, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+    }
     public void SetKey(string key)
     {
         if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Windows DPAPI required");

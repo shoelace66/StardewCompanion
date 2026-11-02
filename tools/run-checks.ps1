@@ -13,6 +13,10 @@ $server=$null
 try{
     & $dotnet build (Join-Path $repoRoot 'StardewCompanion.slnx') -c Release "-p:GamePath=$GamePath"
     if($LASTEXITCODE -ne 0){throw '统一构建失败。'}
+    & $dotnet run --project (Join-Path $repoRoot 'tools\AppChecks\AppChecks.csproj') -c Release --no-build -- $repoRoot
+    if($LASTEXITCODE -ne 0){throw '应用配置与生命周期检查失败。'}
+    & $dotnet run --project (Join-Path $repoRoot 'tools\DesktopChecks\DesktopChecks.csproj') -c Release --no-build -- $repoRoot
+    if($LASTEXITCODE -ne 0){throw '桌面启动与恢复检查失败。'}
     $serverDll=Join-Path $repoRoot 'src\StardewCompanion.Diagnostics\bin\Release\net10.0\StardewCompanion.Diagnostics.dll'
     $start=[Diagnostics.ProcessStartInfo]::new();$start.FileName=$dotnet;$start.WorkingDirectory=$repoRoot;$start.UseShellExecute=$false;$start.CreateNoWindow=$true
     $start.Arguments='"'+$serverDll+'"';$start.EnvironmentVariables['SC_SESSION_FILE']=Join-Path $repoRoot '.local\session.json'

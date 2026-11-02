@@ -14,11 +14,12 @@ public sealed class MainWindow:Window
 {
     private readonly string _data;
     private readonly int? _trialDays;
-    private readonly GameBridge _bridge=new();
+    private GameBridge _bridge=new();
     private CompanionRuntime? _runtime;
     private ModelSettings _settings=new();
     private readonly HttpClient _http=new(){Timeout=TimeSpan.FromSeconds(55)};
     private readonly TextBlock _status=new(){Text="正在启动…",TextWrapping=TextWrapping.Wrap};
+    private readonly TextBlock _startupHint=new(){TextWrapping=TextWrapping.Wrap,Foreground=Brushes.DarkRed};
     private readonly TextBlock _world=new(){Text="等待 AI 加入房间",TextWrapping=TextWrapping.Wrap};
     private readonly TextBlock _question=new(){TextWrapping=TextWrapping.Wrap};
     private readonly TextBox _chat=new(){IsReadOnly=true,AcceptsReturn=true,TextWrapping=TextWrapping.Wrap,VerticalScrollBarVisibility=ScrollBarVisibility.Auto,MinHeight=250};
@@ -33,6 +34,9 @@ public sealed class MainWindow:Window
     private readonly TextBox _plans=new(){IsReadOnly=true,AcceptsReturn=true,TextWrapping=TextWrapping.Wrap,VerticalScrollBarVisibility=ScrollBarVisibility.Auto};
     private readonly DispatcherTimer _timer=new(){Interval=TimeSpan.FromSeconds(1)};
     private bool _closing;
+    private bool _shutdownComplete;
+    private bool _settingsLoaded;
+    private Task? _initializing;
     private string _loadedScope="";
     public MainWindow(string data,int? trialDays=null)
     {
@@ -45,14 +49,14 @@ public sealed class MainWindow:Window
         controls.Children.Add(Button("仅规划",()=>NeedRuntime().SetMode("plan_only")));controls.Children.Add(Button("自主执行",()=>NeedRuntime().SetMode("autonomous")));
         controls.Children.Add(Button("打开原版房主",()=>Launch(false)));controls.Children.Add(Button("打开 AI 客户端",()=>Launch(true)));
         DockPanel.SetDock(controls,Dock.Top);root.Children.Add(controls);
-        var state=new StackPanel{Margin=new Thickness(0,0,0,12)};state.Children.Add(_status);state.Children.Add(_world);DockPanel.SetDock(state,Dock.Top);root.Children.Add(state);
+        var state=new StackPanel{Margin=new Thickness(0,0,0,12)};state.Children.Add(_status);state.Children.Add(_startupHint);state.Children.Add(_world);DockPanel.SetDock(state,Dock.Top);root.Children.Add(state);
         var tabs=new TabControl();root.Children.Add(tabs);
         var conversation=new DockPanel{Margin=new Thickness(12)};
         var ask=new StackPanel{Margin=new Thickness(0,0,0,8)};ask.Children.Add(_question);ask.Children.Add(Button("移除待答问题（不会批准）",()=>{NeedRuntime().ClearQuestion();return Task.CompletedTask;}));DockPanel.SetDock(ask,Dock.Top);conversation.Children.Add(ask);
         var input=new DockPanel{Margin=new Thickness(0,10,0,0)};
         var send=Button("发送给 AI",SendChat);send.MinWidth=110;DockPanel.SetDock(send,Dock.Right);input.Children.Add(send);input.Children.Add(_message);
         var composer=new DockPanel();composer.Children.Add(input);DockPanel.SetDock(input,Dock.Bottom);DockPanel.SetDock(_chatHint,Dock.Top);composer.Children.Add(_chatHint);DockPanel.SetDock(composer,Dock.Bottom);conversation.Children.Add(composer);conversation.Children.Add(_chat);
-        _message.PreviewKeyDown+=(_,e)=>{if(e.Key==System.Windows.Input.Key.Enter&&(System.Windows.Input.Keyboard.Modifiers&System.Windows.Input.ModifierKeys.Shift)==0){e.Handled=true;_ = SendChat();}};
+        _message.PreviewKeyDown+=(_,e)=>{if(e.Key==System.Windows.Input.Key.Enter&&(System.Windows.Input.Keyboard.Modifiers&System.Windows.Input.ModifierKeys.Shift)==0){e.Handled=true;_ = RunAction(SendChat);}};
         tabs.Items.Add(new TabItem{Header="中文聊天与工作",Content=conversation});
         tabs.Items.Add(new TabItem{Header="工作记忆",Content=MemoryPanel()});
         tabs.Items.Add(new TabItem{Header="设置与工作箱",Content=SettingsPanel()});
@@ -66,8 +70,10 @@ public sealed class MainWindow:Window
     private Button Button(string text,Func<Task> action)
     {
         var b=new Button{Content=text,Padding=new Thickness(14,7,14,7),Margin=new Thickness(0,0,8,0)};
-        b.Click+=async(_,_)=>{try{await action();}catch(Exception e){_status.Text=e.Message;}};return b;
+        b.Click+=async(_,_)=>await RunAction(action);return b;
     }
+    private async Task RunAction(Func<Task> action)
+    {if(_closing)return;try{await action();}catch(Exception e){_status.Text=e.Message;}}
     private static void Field(Panel p,string label,Control control)
     {p.Children.Add(new TextBlock{Text=label,Margin=new Thickness(0,9,0,4)});control.Margin=new Thickness(0,0,0,3);if(control is TextBox t)t.Padding=new Thickness(6);p.Children.Add(control);}
     private UIElement MemoryPanel()
@@ -93,34 +99,67 @@ public sealed class MainWindow:Window
             var reply=await test.TestToolCalling(testSettings,timeout.Token);
             _status.Text=$"模型工具调用兼容；observe 探测已验证（{reply.ElapsedMs} ms），未执行游戏动作";
         }));
-        p.Children.Add(Button("保存设置",()=>{_settings.Endpoint=_endpoint.Text.Trim();_settings.Model=_model.Text.Trim();_settings.GamePath=_gamePath.Text.Trim();_settings.ValidateEndpoint();if(_key.Password!="")_settings.SetKey(_key.Password);_settings.Save(Path.Combine(_data,"model.credentials.json"));_key.Clear();NeedRuntime().Settings=_settings;_status.Text="设置已保存";return Task.CompletedTask;}));
+        p.Children.Add(Button("保存设置",SaveSettings));
+        p.Children.Add(Button("重试启动本地服务",Initialize));
         p.Children.Add(new TextBlock{Text="工作箱：先让 AI 到箱子所在地图，再填写当前地图格子坐标。搬迁后需要重新绑定。",TextWrapping=TextWrapping.Wrap,Margin=new Thickness(0,20,0,0)});
         Field(p,"工作箱名称",_chestName);Field(p,"格子 X",_chestX);Field(p,"格子 Y",_chestY);Field(p,"允许物品机器 ID（逗号分隔）",_allowed);Field(p,"保护物品机器 ID（逗号分隔）",_protected);
         p.Children.Add(Button("绑定当前地图的箱子",async()=>{await NeedRuntime().BindChest(_chestName.Text,int.Parse(_chestX.Text),int.Parse(_chestY.Text),Split(_allowed.Text),Split(_protected.Text));LoadMemory();_status.Text="工作箱已绑定";}));
         return new ScrollViewer{Content=p,VerticalScrollBarVisibility=ScrollBarVisibility.Auto};
     }
     private static string[] Split(string text)=>text.Split(new[]{',','，','\n'},StringSplitOptions.RemoveEmptyEntries|StringSplitOptions.TrimEntries);
+    private async Task SaveSettings()
+    {
+        var candidate=new ModelSettings{Endpoint=_endpoint.Text.Trim(),Model=_model.Text.Trim(),GamePath=_gamePath.Text.Trim(),ApiKeyDpapi=_settings.ApiKeyDpapi};
+        candidate.ValidateEndpoint();
+        if(_key.Password!="")candidate.SetKey(_key.Password);
+        candidate.Save(Path.Combine(_data,"model.credentials.json"));
+        _settings=candidate;_settingsLoaded=true;_key.Clear();_startupHint.Text="";
+        if(_runtime!=null){_runtime.Settings=candidate;_status.Text="设置已保存";}
+        else await Initialize();
+    }
     private Task SendChat()
     {
         var text=_message.Text.Trim();
         if(text.Length==0)return Task.CompletedTask;
         NeedRuntime().SendMessage(text);_message.Clear();_message.Focus();return Task.CompletedTask;
     }
-    private async Task Initialize()
+    private Task Initialize()
     {
+        if(_closing||_runtime!=null)return Task.CompletedTask;
+        return _initializing is {IsCompleted:false}?_initializing:_initializing=InitializeCore();
+    }
+    private async Task InitializeCore()
+    {
+        MemoryStore? memory=null;
         try
         {
-            Directory.CreateDirectory(_data);_settings=ModelSettings.Load(Path.Combine(_data,"model.credentials.json"));
-            _endpoint.Text=_settings.Endpoint;_model.Text=_settings.Model;_gamePath.Text=_settings.GamePath;
-            var memory=new MemoryStore(Path.Combine(_data,"memory.db"));
+            Directory.CreateDirectory(_data);
+            if(!_settingsLoaded)
+            {
+                _settings=ModelSettings.LoadForEditing(Path.Combine(_data,"model.credentials.json"),out var recoveryFile);
+                _settingsLoaded=true;
+                _endpoint.Text=_settings.Endpoint;_model.Text=_settings.Model;_gamePath.Text=_settings.GamePath;
+                if(recoveryFile!=null)_startupHint.Text="设置文件损坏，已备份至 "+recoveryFile+"。请重新填写并保存模型设置。";
+            }
+            _status.Text="正在启动本地服务…";
+            memory=new MemoryStore(Path.Combine(_data,"memory.db"));
             await _bridge.Start(Path.Combine(_data,"session.json"));
+            if(_closing)return;
             _runtime=new CompanionRuntime(_bridge,memory,_settings,_http,Path.Combine(_data,"logs","events.jsonl"));
+            memory=null; // The runtime now owns the store.
             _runtime.AutonomousTrialEndDay=_trialDays;
             _bridge.AttachAgent(_runtime);
             _runtime.ChatReceived+=(role,text)=>Dispatcher.BeginInvoke(()=>{_chat.AppendText($"{role}：{text}\n\n");_chat.ScrollToEnd();});
             _runtime.Start();_timer.Start();_status.Text="服务已就绪。请先打开原版房主，再让 AI 加入。";
         }
-        catch(Exception e){_status.Text="启动失败，自动执行未启动："+e.Message;}
+        catch(Exception e)
+        {
+            _status.Text="启动失败，自动执行未启动："+e.Message+"。处理后可在设置页重试启动。";
+            try { await StopServices(); }
+            catch(Exception cleanup){_status.Text+=" 清理失败："+cleanup.Message;}
+            finally { _bridge=new(); }
+        }
+        finally { memory?.Dispose(); }
     }
     private void Refresh()
     {
@@ -154,7 +193,18 @@ public sealed class MainWindow:Window
     }
     private async void OnClosing(object? sender,System.ComponentModel.CancelEventArgs e)
     {
-        if(_closing)return;e.Cancel=true;_closing=true;_timer.Stop();
-        try{if(_runtime!=null)await _runtime.DisposeAsync();await _bridge.DisposeAsync();}catch{}finally{_http.Dispose();Close();}
+        if(_shutdownComplete)return;e.Cancel=true;if(_closing)return;_closing=true;_timer.Stop();
+        try
+        {
+            try { if(_initializing!=null)await _initializing; }
+            finally { await StopServices(); }
+        }
+        catch(Exception error){Debug.WriteLine("Shutdown cleanup failed: "+error);}
+        finally{_http.Dispose();_shutdownComplete=true;Close();}
+    }
+    private async Task StopServices()
+    {
+        try { if(_runtime!=null)await _runtime.DisposeAsync(); }
+        finally { _runtime=null;await _bridge.DisposeAsync(); }
     }
 }

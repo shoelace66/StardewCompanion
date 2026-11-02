@@ -25,6 +25,8 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
     private bool _trialFinished;
     private CancellationTokenSource? _request;
     private Task? _loop;
+    private readonly object _lifecycleGate=new();
+    private Task? _disposeTask;
     private Task? _thinking;
     private string _session="";
     private int _day=-1;
@@ -50,7 +52,14 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
         Decisions=new(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(logPath))!,"decisions.jsonl"));
         bridge.Observed+=OnObserved;bridge.Result+=OnResult;
     }
-    public void Start()=>_loop=Run();
+    public void Start()
+    {
+        lock(_lifecycleGate)
+        {
+            ObjectDisposedException.ThrowIf(_disposeTask!=null,this);
+            _loop??=Run();
+        }
+    }
     private void OnObserved(GameObservation state)
     {
         if(!ControlModePolicy.CanControl(state))return;
@@ -396,5 +405,29 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
     }
     private static string SafeError(Exception e)=>e is HttpRequestException or InvalidOperationException or ArgumentException?e.Message:e.GetType().Name;
     private void Log(object value){try{Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(_logPath))!);lock(_logPath)File.AppendAllText(_logPath,JsonSerializer.Serialize(new{at=DateTime.UtcNow,data=value})+Environment.NewLine);}catch(IOException){}}
-    public async ValueTask DisposeAsync(){_bridge.Observed-=OnObserved;_bridge.Result-=OnResult;await Pause();_lifetime.Cancel();if(_loop!=null)await _loop;if(_thinking!=null)try{await _thinking;}catch{} if(_planTask!=null)try{await _planTask;}catch{} _planCancellation?.Dispose();_memory.Dispose();}
+    public ValueTask DisposeAsync()
+    {
+        lock(_lifecycleGate) return new(_disposeTask??=DisposeCore());
+    }
+    private async Task DisposeCore()
+    {
+        _bridge.Observed-=OnObserved;_bridge.Result-=OnResult;
+        _lifetime.Cancel();
+        try
+        {
+            try { await Pause(); }
+            catch(Exception ex) when(ex is IOException or System.Net.WebSockets.WebSocketException or OperationCanceledException) { }
+        }
+        finally
+        {
+            try
+            {
+                await Task.WhenAll(new[]{_loop,_thinking,_planTask}.OfType<Task>());
+            }
+            finally
+            {
+                _planCancellation?.Dispose();_lifetime.Dispose();_memory.Dispose();
+            }
+        }
+    }
 }

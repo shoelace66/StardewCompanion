@@ -150,11 +150,14 @@ internal sealed class AreaActionExecutor
         {
             Tool? tool=_skill=="till_area"?Game1.player.Items.OfType<Hoe>().FirstOrDefault():ClearTool(tile);
             if(tool==null)return End("required_tool_missing");
-            if(tool is MeleeWeapon&&Game1.currentLocation.terrainFeatures.Pairs.Any(p=>Math.Abs(p.Key.X-tile.X)<=3&&Math.Abs(p.Key.Y-tile.Y)<=3&&p.Value is HoeDirt {crop:not null} soil&&!soil.crop.dead.Value))return End("live_crop_protected_from_scythe_area");
+            if(tool is MeleeWeapon&&HasScytheHarvestRisk(tile,tool))return End("harvestable_crop_protected_from_scythe_area");
             Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(tool);input.Tool=true;
         }
         _wait=now+700;Phase="verify_action";return "running";
     }
+    internal static bool HasScytheHarvestRisk(GridPoint tile,Tool tool)=>Game1.currentLocation.terrainFeatures.Pairs.Any(p=>
+        Math.Abs(p.Key.X-tile.X)<=3&&Math.Abs(p.Key.Y-tile.Y)<=3&&p.Value is HoeDirt {crop:not null} soil&&WorldView.Ready(soil.crop)
+        &&(soil.crop.GetHarvestMethod()==StardewValley.GameData.Crops.HarvestMethod.Scythe||tool.ItemId=="66"));
     private static float TreeHealth(GridPoint p)=>Game1.currentLocation.terrainFeatures.TryGetValue(new(p.X,p.Y),out var f)&&f is Tree t?t.health.Value:0;
     private Tool? ClearTool(GridPoint p)
     {

@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$RunRoot='', [string]$GamePath='F:\SteamLibrary\steamapps\common\Stardew Valley')
+param([string]$RunRoot='', [string]$GamePath='F:\SteamLibrary\steamapps\common\Stardew Valley',[switch]$RestartGoal,[switch]$ResetAgentMemory)
 $ErrorActionPreference='Stop'
 $repo=Split-Path -Parent $PSScriptRoot
 $currentPath=Join-Path $repo '.local/solo5-current.json'
@@ -36,6 +36,14 @@ $backup=Join-Path $repo ('.local/solo-resume-backups/'+$runId+'/'+$stamp)
 New-Item -ItemType Directory -Path $backup -Force|Out-Null
 Copy-Item -LiteralPath $save -Destination (Join-Path $backup 'native-save') -Recurse
 Copy-Item -LiteralPath $RunRoot -Destination (Join-Path $backup 'agent-data') -Recurse
+if($ResetAgentMemory){
+ $memoryArchive=Join-Path $backup 'retired-memory'
+ New-Item -ItemType Directory -Path $memoryArchive -Force|Out-Null
+ foreach($suffix in @('memory.db','memory.db-wal','memory.db-shm')){
+  $source=Join-Path $RunRoot $suffix
+  if(Test-Path -LiteralPath $source){Move-Item -LiteralPath $source -Destination $memoryArchive}
+ }
+}
 $dotnet=Join-Path $repo '.tools/dotnet/dotnet.exe'
 foreach($project in @('src/StardewCompanion.Diagnostics/StardewCompanion.Diagnostics.csproj','src/StardewCompanion.Mod/StardewCompanion.Mod.csproj','tools/Fixture/Fixture.csproj','src/StardewCompanion.Desktop/StardewCompanion.Desktop.csproj')){
  & $dotnet build (Join-Path $repo $project) -c Release --no-restore "-p:GamePath=$GamePath"
@@ -50,11 +58,14 @@ $backend.FileName=$dotnet;$backend.Arguments='"'+(Join-Path $repo 'src/StardewCo
 $backend.UseShellExecute=$false;$backend.CreateNoWindow=$true;$backend.WindowStyle='Hidden';$backend.WorkingDirectory=$repo
 $backend.EnvironmentVariables['SC_SESSION_FILE']=$sessionPath;$backend.EnvironmentVariables['SC_AGENT_DATA']=$RunRoot
 $backend.EnvironmentVariables['SC_MODEL_SETTINGS']=Join-Path $repo '.local/model.credentials.json'
-$oldSession=[IO.File]::ReadAllText($sessionPath)
 $newService=[Diagnostics.Process]::Start($backend)
 $deadline=[DateTime]::UtcNow.AddSeconds(20)
-do{Start-Sleep -Milliseconds 200;if($newService.HasExited){throw 'Updated backend exited before accepting connections'}}while(([IO.File]::ReadAllText($sessionPath) -eq $oldSession) -and [DateTime]::UtcNow -lt $deadline)
-if([IO.File]::ReadAllText($sessionPath) -eq $oldSession){throw 'Updated backend did not publish its session'}
+do{
+ Start-Sleep -Milliseconds 200
+ if($newService.HasExited){throw 'Updated backend exited before accepting connections'}
+ try{$null=Invoke-RestMethod ($base+'/agent/state') -Headers @{Authorization='Bearer '+$session.token} -TimeoutSec 1;$ready=$true}catch{}
+}while(-not $ready -and [DateTime]::UtcNow -lt $deadline)
+if(-not $ready){throw 'Updated backend did not accept authenticated agent requests'}
 $session=Get-Content -LiteralPath $sessionPath -Raw|ConvertFrom-Json
 $game=[Diagnostics.ProcessStartInfo]::new()
 $game.FileName=Join-Path $GamePath 'StardewModdingAPI.exe';$game.Arguments='--mods-path "'+$mods+'" --no-terminal'
@@ -67,7 +78,7 @@ $evidence=Join-Path $repo '.local/business-validation.json'
 if(Test-Path -LiteralPath $evidence){$game.EnvironmentVariables['SC_BUSINESS_EVIDENCE']=$evidence}
 $client=[Diagnostics.Process]::Start($game)
 $watch=[Diagnostics.ProcessStartInfo]::new();$watch.FileName='powershell.exe'
-$watch.Arguments='-NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $PSScriptRoot 'watch-solo-autonomy.ps1')+'" -RunRoot "'+$RunRoot+'" -Days '+$trial.trialDays+' -Resume'
+$watch.Arguments='-NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $PSScriptRoot 'watch-solo-autonomy.ps1')+'" -RunRoot "'+$RunRoot+'" -Days '+$trial.trialDays+' -Resume'+$(if($RestartGoal){' -RestartGoal'}else{''})
 $watch.UseShellExecute=$false;$watch.CreateNoWindow=$true;$watch.WindowStyle='Hidden';$watch.WorkingDirectory=$repo
 $watcher=[Diagnostics.Process]::Start($watch)
 @{runId=$runId;runRoot=$RunRoot;servicePid=$newService.Id;gamePid=$client.Id;watcherPid=$watcher.Id;sessionFile=$sessionPath;trialDays=$trial.trialDays;resumedAt=[DateTimeOffset]::Now.ToString('o');backup=$backup}|ConvertTo-Json|Set-Content -LiteralPath $currentPath -Encoding UTF8

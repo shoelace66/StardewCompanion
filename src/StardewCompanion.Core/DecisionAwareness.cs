@@ -21,8 +21,8 @@ public sealed partial class CompanionRuntime
     private void RetireWorkingBlockers()
     {
         lock(_awarenessGate){LoadAwareness();
-            var feedback=_awareness["actionFeedback"]!.AsObject();feedback["blockers"]=new JsonArray();
-            feedback["revision"]=feedback["revision"]!.GetValue<long>()+1;
+            var feedback=_awareness["actionFeedback"]!.AsObject();feedback["blockers"]=new JsonArray();feedback["latest"]=null;
+            var revision=feedback["revision"]!.GetValue<long>()+1;feedback["revision"]=revision;feedback["deliveredRevision"]=revision;
             _awareness["revision"]=_awareness["revision"]!.GetValue<long>()+1;SaveAwareness();
         }
     }
@@ -67,6 +67,7 @@ public sealed partial class CompanionRuntime
                     existing["taskId"]=taskId;existing["latestReason"]=reason;
                 }
                 else blockers.Add(new JsonObject{["key"]=key,["reason"]=reason,["skill"]=skill,["target"]=target?.DeepClone(),
+                    ["blockedDay"]=_day,["evidence"]=DecisionContextCompression.Get(receiptNode,"businessDetails")?.DeepClone(),
                     ["taskId"]=DecisionContextCompression.Text(receiptNode,"taskId"),["count"]=1,["location"]=_bridge.Observation?.Location,["stateKey"]=StateKey(_bridge.Observation),
                     ["meaning"]=reason.Contains("inventory_full")?"目标物品未能采入背包；先释放容量，计划未执行步骤仍未完成":"本次动作未完全成功；检查原始原因及未执行步骤"});
             }
@@ -99,7 +100,8 @@ public sealed partial class CompanionRuntime
                             resolved|=targets.Length==0||targets.All(f=>f?["canAccept"]?.GetValue<bool>()==true);
                         }
                     }
-                }else resolved=b["stateKey"]?.ToString()!=StateKey(state);
+                }else if(b["reason"]?.ToString()=="shop_closed_for_day")resolved=b["blockedDay"]?.GetValue<int>()!=state.GameDay;
+                else resolved=b["stateKey"]?.ToString()!=StateKey(state);
                 if(resolved){blockers.Remove(b);changed=true;Trace("blocker_resolved",b);}
             }
             if(changed){_triggerKind="important_event";_awareness["revision"]=_awareness["revision"]!.GetValue<long>()+1;SaveAwareness();WakeDecision();}

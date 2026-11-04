@@ -54,6 +54,9 @@ public sealed partial class CompanionRuntime
             goal["version"]=(old["version"]?.GetValue<int>()??0)+1;goal["status"]="active";
             goal["originalInstructions"]=new JsonArray(update.Objective);
             _memory.Set(_scope,"player_goal",goal.ToJsonString());
+            // A replacement goal retires an earlier question. This does not grant
+            // any permission; action-level policies still require their own authorization.
+            PendingQuestion="";_memory.Set(_scope,"pendingQuestion","");
             var work=WorkState();work["currentObjective"]="";work["objectiveBasis"]="";work["next"]=new JsonArray();
             work["goalVersion"]=goal["version"]!.DeepClone();_memory.Set(_scope,"agent_working_state",work.ToJsonString());
             _expandedTools=false;_scopedPlanSkills=Array.Empty<string>();_triggerKind="goal_updated";
@@ -78,10 +81,21 @@ public sealed partial class CompanionRuntime
         lock(_inputGate){var work=WorkState();
             if(work["session"]?.ToString()!=observation.SessionId){
                 work["confirmedMilestones"]=new JsonArray();work["session"]=observation.SessionId;
+                work["currentObjective"]="";work["objectiveBasis"]="";work["next"]=new JsonArray();work["activePlanId"]="";
                 _memory.Set(_scope,"agent_working_state",work.ToJsonString());
             }
             _lastInput=new JsonObject();
         }
+    }
+    private void RetireWorkingDay()
+    {
+        lock(_inputGate){var work=WorkState();work["currentObjective"]="";work["objectiveBasis"]="";work["next"]=new JsonArray();work["activePlanId"]="";
+            _memory.Set(_scope,"agent_working_state",work.ToJsonString());}
+    }
+    private void RetireWorkingBatch(string planId)
+    {
+        lock(_inputGate){var work=WorkState();if(work["activePlanId"]?.ToString()!=planId)return;
+            work["next"]=new JsonArray();work["activePlanId"]="";_memory.Set(_scope,"agent_working_state",work.ToJsonString());}
     }
     private void CancelInputState()
     {
@@ -98,7 +112,8 @@ public sealed partial class CompanionRuntime
             if(replaceObjective||string.IsNullOrEmpty(work["currentObjective"]?.ToString())){
                 work["currentObjective"]=DecisionContextCompression.Text(args,"goal");work["objectiveBasis"]=DecisionContextCompression.Text(args,"basis");
             }
-            if(args["pending"] is JsonArray next&&next.Count>0)work["next"]=new JsonArray(next.Take(8).Select(v=>v?.DeepClone()).ToArray());
+            if(args["pending"] is JsonArray next)work["next"]=new JsonArray(next.Take(8).Select(v=>v?.DeepClone()).ToArray());
+            work["activePlanId"]=args["planId"]?.DeepClone();
             work["goalVersion"]=PlayerGoal["version"]?.DeepClone();
             _memory.Set(_scope,"agent_working_state",work.ToJsonString());
         }
@@ -117,18 +132,27 @@ public sealed partial class CompanionRuntime
             _memory.Set(_scope,"agent_working_state",work.ToJsonString());
         }
     }
-    private void QueueConversation(string message)
+    private string QueueConversation(string message)
     {
+        var id=Guid.NewGuid().ToString("N");
         lock(_inputGate){var items=JsonNode.Parse(_memory.Get(_scope,"conversation_outbox")??"[]")!.AsArray();
-            items.Add(new JsonObject{["id"]=Guid.NewGuid().ToString("N"),["text"]=message,["at"]=DateTimeOffset.UtcNow.ToString("o"),
+            items.Add(new JsonObject{["id"]=id,["text"]=message,["at"]=DateTimeOffset.UtcNow.ToString("o"),
                 ["answerTo"]=PendingQuestion==""?null:JsonValue.Create(PendingQuestion)});
             _memory.Set(_scope,"conversation_outbox",items.ToJsonString());_triggerKind="player_message";
         }
+        return id;
     }
     private JsonObject ConversationSnapshot()
     {
         lock(_inputGate)return new JsonObject{["newMessages"]=JsonNode.Parse(_memory.Get(_scope,"conversation_outbox")??"[]"),
             ["unansweredQuestions"]=PendingQuestion==""?new JsonArray():new JsonArray(PendingQuestion)};
+    }
+    private QueuedInstruction? LatestPendingConversation()
+    {
+        lock(_inputGate){var items=JsonNode.Parse(_memory.Get(_scope,"conversation_outbox")??"[]") as JsonArray??new();
+            var latest=items.LastOrDefault() as JsonObject;var text=latest?["text"]?.ToString();var id=latest?["id"]?.ToString();
+            return string.IsNullOrWhiteSpace(text)||string.IsNullOrWhiteSpace(id)?null:new(_scope,_session,text,false,id);
+        }
     }
     private void ConfirmConversation(JsonObject snapshot)
     {
@@ -137,6 +161,13 @@ public sealed partial class CompanionRuntime
             var removed=new List<string>();
             foreach(var item in items.ToArray())if(ids.Contains(item?["id"]?.ToString())){removed.Add(item!["id"]!.ToString());items.Remove(item);}
             if(removed.Count>0){_memory.Set(_scope,"conversation_outbox",items.ToJsonString());Trace("conversation_delivered",new{messageIds=removed});}
+        }
+    }
+    private void ConfirmConversationMessage(string id)
+    {
+        lock(_inputGate){var items=JsonNode.Parse(_memory.Get(_scope,"conversation_outbox")??"[]")!.AsArray();
+            var item=items.FirstOrDefault(m=>m?["id"]?.ToString()==id);if(item==null)return;items.Remove(item);
+            _memory.Set(_scope,"conversation_outbox",items.ToJsonString());Trace("conversation_delivered",new{messageIds=new[]{id}});
         }
     }
     private static bool MiningSkill(string skill)=>skill.Contains("mine",StringComparison.OrdinalIgnoreCase)||skill.Contains("cavern",StringComparison.OrdinalIgnoreCase);
@@ -159,7 +190,7 @@ public sealed partial class CompanionRuntime
         skills.UnionWith(_scopedPlanSkills);
         var farming=state.Location=="Farm"||intent.Contains("种")||intent.Contains("作物")||intent.Contains("开荒")||intent.Contains("farm",StringComparison.OrdinalIgnoreCase);
         if(farming)skills.UnionWith(new[]{"water_area","harvest_area","refill_water","cultivate_plot","maintain_plot","harvest_and_replant","gather_resource","clear_area","till_area","plant_area"});
-        if((w["inventoryState"]?["freeSlots"]?.GetValue<int>()??12)<=2||_memory.Chests(_scope).Length>0||intent.Contains("仓")||intent.Contains("箱"))
+        if(_memory.Chests(_scope).Length>0)
             skills.UnionWith(new[]{"deposit_items","withdraw_items"});
         skills.UnionWith(new[]{"craft_items","craft_and_place"});
         if(state.Menu!="")skills.Add("respond_dialogue");
@@ -170,12 +201,14 @@ public sealed partial class CompanionRuntime
         if((w["mailbox"]?["unreadCount"]?.GetValue<int>()??0)>0)queries.Add("read_mailbox");
         var disabled=DisabledSkills();var output=new JsonArray();
         foreach(var tool in all){var clone=tool!.DeepClone();var f=clone["function"]!;var name=f["name"]!.ToString();
+            if((name is "deposit_items" or "withdraw_items")&&_memory.Chests(_scope).Length==0)continue;
             if(MiningSkill(name)||disabled.Contains(name))continue;
             if(name.StartsWith("group_",StringComparison.Ordinal)){
                 var variants=f["parameters"]!["properties"]!["steps"]!["items"]!["oneOf"]!.AsArray();
                 foreach(var variant in variants.ToArray()){
                     var skill=variant!["properties"]!["skill"]!["enum"]![0]!.ToString();
-                    if(MiningSkill(skill)||disabled.Contains(skill))variants.Remove(variant);
+                    var needsBoundChest=skill is "deposit_items" or "withdraw_items";
+                    if(MiningSkill(skill)||disabled.Contains(skill)||needsBoundChest&&_memory.Chests(_scope).Length==0)variants.Remove(variant);
                 }
                 if(variants.Count==0)continue;
             }else if(!_expandedTools&&!queries.Contains(name)&&!ToolCatalog.TopLevelFrequentTools.Contains(name))continue;
@@ -219,9 +252,10 @@ public sealed partial class CompanionRuntime
                 pendingEvents.Count>0?"important_event":feedback?["revision"]?.ToString()!=feedback?["deliveredRevision"]?.ToString()?"task_terminal":_triggerKind;
             var triggerReason=kind switch{
                 "player_message"=>"玩家发来新消息", "goal_updated"=>"玩家更新了长期目标", "new_day"=>"进入新的游戏日", "task_terminal"=>"本地操作已返回结果",
+                "no_action_retry"=>"上一轮只叙述计划但未选择可执行工具；请选择一个下一步工具，或明确调用wait_for_change等待条件",
                 "important_event"=>"收到游戏事件或操作结果", "wait_condition_changed"=>"等待条件已变化", "session_started"=>"连接当前游戏会话", _=>"继续推进当前工作"};
             var season=GetSeasonPlan();
-            if(season is JsonObject seasonObject){seasonObject.Remove("progress");work["seasonPlan"]=seasonObject;}
+            if(season is JsonObject seasonObject)work["seasonPlan"]=seasonObject;
             var input=new JsonObject{
                 ["trigger"]=new JsonObject{["kind"]=kind,["gameDay"]=state.GameDay,["reason"]=triggerReason},
                 ["playerGoal"]=goal,["conversation"]=conversation.DeepClone(),["agentState"]=work,
@@ -239,6 +273,7 @@ public sealed partial class CompanionRuntime
         var w=JsonNode.Parse(state.WorldView) as JsonObject??new();var facts=w["decisionFacts"];
         var world=new JsonObject{["observationRevision"]=state.Revision,["gameDay"]=state.GameDay,["time"]=$"{state.TimeOfDay/100:D2}:{state.TimeOfDay%100:D2}",
             ["location"]=state.Location,["tile"]=JsonSerializer.SerializeToNode(state.Tile),["stamina"]=state.Stamina,["health"]=state.Health,
+            ["maxStamina"]=facts?["maxStamina"]?.DeepClone()??w["maxStamina"]?.DeepClone(),["maxHealth"]=facts?["maxHealth"]?.DeepClone(),
             ["money"]=w["money"]?.DeepClone(),["rain"]=w["rain"]?.DeepClone(),["inventoryState"]=w["inventoryState"]?.DeepClone(),
             ["mailbox"]=w["mailbox"]?.DeepClone(),["menu"]=state.Menu,["menuContext"]=JsonNode.Parse(state.MenuContext),
             ["calendar"]=facts?["calendar"]?.DeepClone(),["risks"]=new JsonObject{["nativeForcedPassOutTime"]=facts?["nativeForcedPassOutTime"]?.DeepClone(),

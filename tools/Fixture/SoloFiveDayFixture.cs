@@ -8,6 +8,7 @@ namespace StardewCompanion.Fixture;
 
 public sealed partial class FixtureMod
 {
+    private bool _shopMapLogged;
     private void SoloTick()
     {
         var name=Environment.GetEnvironmentVariable("SC_SOLO_TEST_NAME")??"";
@@ -28,6 +29,14 @@ public sealed partial class FixtureMod
         }
         if(_ticks%60==0&&Context.IsWorldReady&&Context.IsMainPlayer&&Game1.player.farmName.Value==name)
         {
+            if(!_shopMapLogged){
+                _shopMapLogged=true;var shop=Game1.getLocationFromName("SeedShop");var actions=new List<object>();
+                for(var x=0;x<shop.Map.Layers[0].LayerWidth;x++)for(var y=0;y<shop.Map.Layers[0].LayerHeight;y++){
+                    var action=shop.doesTileHaveProperty(x,y,"Action","Buildings");
+                    if(action!=null&&(action.StartsWith("Buy ",StringComparison.Ordinal)||action.StartsWith("OpenShop ",StringComparison.Ordinal)))actions.Add(new{x,y,action});
+                }
+                Monitor.Log("Read-only shop interaction diagnostics: "+JsonSerializer.Serialize(actions),LogLevel.Debug);
+            }
             var output=Environment.GetEnvironmentVariable("SC_SOLO_TEST_EVIDENCE");
             if(!string.IsNullOrEmpty(output))File.WriteAllText(output,JsonSerializer.Serialize(new{
                 saveId=Game1.uniqueIDForThisGame.ToString(),runId=name,player=Game1.player.Name,day=Game1.Date.TotalDays,

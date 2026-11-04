@@ -70,6 +70,8 @@ public sealed partial class MemoryStore : IDisposable
     public void State(string scope,long id,string state) {lock(_gate){using var c=Command("UPDATE memory SET state=$v WHERE scope=$s AND id=$i",("$v",state),("$s",scope),("$i",id));c.ExecuteNonQuery();}}
     public void Set(string scope, string key, string value) { lock (_gate) { using var c = Command("INSERT INTO settings VALUES($s,$k,$v) ON CONFLICT(scope,key) DO UPDATE SET value=$v", ("$s",scope),("$k",key),("$v",value)); c.ExecuteNonQuery(); } }
     public string? Get(string scope, string key) { lock (_gate) { using var c = Command("SELECT value FROM settings WHERE scope=$s AND key=$k", ("$s",scope),("$k",key)); return c.ExecuteScalar() as string; } }
+    public string? LatestChatScope()
+    { lock(_gate){using var c=Command("SELECT scope FROM chat ORDER BY id DESC LIMIT 1");return c.ExecuteScalar() as string;} }
     public void Reconcile(string scope, string session, int day)
     {
         lock (_gate)

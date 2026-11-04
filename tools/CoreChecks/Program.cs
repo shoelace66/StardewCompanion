@@ -111,7 +111,21 @@ server.MapPost("/chat/completions",async context=>
     requested.TrySetResult();await release.Task;
     await context.Response.WriteAsJsonAsync(new{choices=new[]{new{message=new{role="assistant",content="",tool_calls=new[]{new{id="call1",type="function",function=new{name="go_to",arguments="{\"location\":\"Farm\",\"x\":1,\"y\":2}"}}}}}},usage=new{total_tokens=15}});
 });
+server.MapPost("/unicode",async context=>{
+    using var body=await JsonDocument.ParseAsync(context.Request.Body);
+    var response=new JsonObject{["choices"]=new JsonArray(new JsonObject{["message"]=new JsonObject{
+        ["role"]="assistant",["content"]="明天继续浇水",["tool_calls"]=new JsonArray(new JsonObject{["id"]="unicode",["type"]="function",
+            ["function"]=new JsonObject{["name"]="save_plan",["arguments"]=JsonSerializer.Serialize(new{goal="土豆种植"},DecisionContextCompression.ReadableJson)}})}})};
+    context.Response.ContentType="application/json";
+    await context.Response.Body.WriteAsync(System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(response,DecisionContextCompression.ReadableJson)));
+});
 await server.StartAsync();
+if(OperatingSystem.IsWindows()){
+    var unicodeSettings=new ModelSettings{Endpoint=server.Urls.Single()+"/unicode",Model="local-fake"};unicodeSettings.SetKey("not-real");
+    using var fallbackHttp=new HttpClient(new ForceWindowsTransport());
+    var reply=await new ModelClient(fallbackHttp).Complete(unicodeSettings,new JsonArray(new JsonObject{["role"]="user",["content"]="检查中文参数"}),CancellationToken.None);
+    Assert(reply.Text=="明天继续浇水"&&JsonNode.Parse(reply.Calls[0]!["function"]!["arguments"]!.GetValue<string>())!["goal"]!.ToString()=="土豆种植","Windows fallback preserves UTF-8 response text and nested tool arguments without a response charset");
+}
 var probeSettings=new ModelSettings{Endpoint=server.Urls.Single()+"/probe",Model="local-fake"};probeSettings.SetKey("test-key-not-real");
 using(var probeHttp=new HttpClient())
 {
@@ -169,6 +183,10 @@ static void Assert(bool ok,string text){if(!ok)throw new Exception("FAIL: "+text
 static void Reject(Action action,string text){try{action();}catch(InvalidOperationException){Console.WriteLine("PASS: "+text);return;}throw new Exception("FAIL: "+text);}
 static async Task Until(Func<bool> condition,string text)
 {var until=Environment.TickCount64+7000;while(!condition()&&Environment.TickCount64<until)await Task.Delay(25);Assert(condition(),text);}
+sealed class ForceWindowsTransport:HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken cancellation)=>throw new IOException("force Windows fallback for UTF-8 regression");
+}
 sealed class FakeBridge:IGameBridge
 {
     public GameObservation? Observation{get;private set;}

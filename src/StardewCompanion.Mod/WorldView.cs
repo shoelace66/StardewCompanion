@@ -134,10 +134,12 @@ internal static class WorldView
         var minutes=Game1.timeOfDay/100*60+Game1.timeOfDay%100;
         var wood=p.Items.Where(i=>i?.QualifiedItemId=="(O)388").Sum(i=>i.Stack);
         var farm=Game1.getLocationFromName("Farm");var farmhouse=Utility.getHomeOfFarmer(p);
-        object FarmState(GameLocation? location)=>location==null?new{chests=Array.Empty<object>(),healthyCrops=0,readyCrops=0}:
+        object FarmState(GameLocation? location)=>location==null?new{chests=Array.Empty<object>(),healthyCrops=0,readyCrops=0,wateredCrops=0,cropsNeedingWater=0}:
             new{chests=location.objects.Pairs.Where(o=>o.Value is Chest c&&WorkChest(c)).Select(o=>(object)new{x=(int)o.Key.X,y=(int)o.Key.Y,bound=o.Value.modData.ContainsKey(ChestKey),id=o.Value.modData.TryGetValue(ChestKey,out var id)?id:null}).ToArray(),
                 healthyCrops=location.terrainFeatures.Values.OfType<HoeDirt>().Count(d=>d.crop!=null&&!d.crop.dead.Value),
-                readyCrops=location.terrainFeatures.Values.OfType<HoeDirt>().Count(d=>Ready(d.crop))};
+                readyCrops=location.terrainFeatures.Values.OfType<HoeDirt>().Count(d=>Ready(d.crop)),
+                wateredCrops=location.terrainFeatures.Values.OfType<HoeDirt>().Count(d=>d.crop!=null&&!d.crop.dead.Value&&d.state.Value==1),
+                cropsNeedingWater=location.terrainFeatures.Values.OfType<HoeDirt>().Count(d=>NeedsWater(d,location))};
         return new{
             autonomy="LLM决定是否继续工作、返家或睡觉，本地无体力/时间接管",
             calendar=new{season=Game1.currentSeason,dayOfSeason=Game1.dayOfMonth,dayOfWeek=new[]{"Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"}[Math.Clamp((Game1.dayOfMonth-1)%7,0,6)],timeOfDayHHMM=Game1.timeOfDay,clockMeaning="HHMM-style; 1320 means 13:20"},

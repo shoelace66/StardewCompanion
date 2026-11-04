@@ -44,6 +44,17 @@ internal static class AwarenessChecks
             bridge.Observation!.GameDay++;bridge.Publish();
             Check(runtime.Memory.Get(runtime.Scope,"season_maintenance")!.Contains("spring"),"sleep maintenance resolves the actual decisionFacts.calendar.season path");
         }
+        {
+            var replacementBridge=new AwarenessBridge();var replacementSettings=new ModelSettings{Endpoint="http://localhost:5011/v1/chat/completions",Model="replacement-goal-check"};
+            await using var replacement=new CompanionRuntime(replacementBridge,new MemoryStore(Path.Combine(folder,"replacement-goal.db")),replacementSettings,new HttpClient(new CaptureModel()),Path.Combine(folder,"replacement-goal.jsonl"));
+            replacementBridge.Publish();
+            replacement.Memory.Set(replacement.Scope,"decision_awareness",new JsonObject{
+                ["revision"]=4,["actionFeedback"]=new JsonObject{["revision"]=3,["deliveredRevision"]=1,["latest"]=new JsonObject{["reason"]="old_path_unreachable"},["blockers"]=new JsonArray(new JsonObject{["reason"]="old_path_unreachable"})},
+                ["pendingEvents"]=new JsonArray(),["deliveredEvents"]=new JsonArray(),["seenEventIds"]=new JsonArray()}.ToJsonString());
+            await replacement.UpdateGoal(new PlayerGoalUpdate{Objective="继续投资土豆并完成播种"});
+            var feedback=replacement.AwarenessSnapshot()["actionFeedback"]!;
+            Check(feedback["blockers"]!.AsArray().Count==0&&feedback["latest"]==null&&feedback["revision"]!.GetValue<long>()==feedback["deliveredRevision"]!.GetValue<long>(),"a replacement goal retires stale action feedback without granting permissions");
+        }
         await using(var restored=new CompanionRuntime(bridge,new MemoryStore(dbPath),settings,new HttpClient(new CaptureModel()),Path.Combine(folder,"restored.jsonl"))){
             bridge.EventIds=new[]{"mail-1","mail-2"};bridge.Publish();
             Check(restored.AwarenessSnapshot()["pendingEvents"]!.AsArray().Count==1,"restart retains pending mail but does not replay acknowledged older events");
@@ -62,7 +73,7 @@ internal static class AwarenessChecks
             Requests.Enqueue(JsonNode.Parse(await request.Content!.ReadAsStringAsync(ct))!.AsObject());
             if(Fail)return new(HttpStatusCode.ServiceUnavailable){Content=new StringContent("unavailable")};
             var n=Requests.Count;var name=n<=2?"group_resources_exploration":"wait_for_change";
-            object args=n<=2?new{planId="forage-"+n,goal="依次采集两个已观察目标",basis="visible flowers",assumptions=Array.Empty<string>(),successCriteria=new[]{"actual pickup"},pending=Array.Empty<string>(),steps=new[]{new{skill="forage_area",arguments=new{location="Town",x=51,y=31,width=1,height=1}},new{skill="forage_area",arguments=new{location="Town",x=52,y=31,width=1,height=1}}}}:new{seconds=120,reason="验证后等待"};
+            object args=n<=2?new{planId="forage-"+n,steps=new[]{new{skill="forage_area",arguments=new{location="Town",x=51,y=31,width=1,height=1}},new{skill="forage_area",arguments=new{location="Town",x=52,y=31,width=1,height=1}}}}:new{seconds=120,reason="验证后等待"};
             return new(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(new{choices=new[]{new{message=new{role="assistant",content="",tool_calls=new[]{new{id="call-"+n,type="function",function=new{name,arguments=JsonSerializer.Serialize(args)}}}}}}}))};
         }
     }

@@ -43,25 +43,43 @@ internal sealed partial class NativeWorkExecutor
             _results.Add(new{source,quests=Game1.player.questLog.Select(q=>new{id=q.id.Value,title=q.questTitle,completed=q.completed.Value}).ToArray()});
             _index++;Completed++;return "running";
         }
-        if(Game1.activeClickableMenu is DialogueBox dialogue)return Dialogue(dialogue);
+        if(Game1.activeClickableMenu is DialogueBox dialogue){
+            if(source=="recipes"&&dialogue.isQuestion&&!dialogue.responses.Any(r=>r.responseKey=="The")){
+                if(dialogue.transitioning||dialogue.safetyTimer>0)return "running";
+                if(dialogue.characterIndexInDialogue<dialogue.getCurrentString().Length-1){dialogue.receiveLeftClick(dialogue.x+64,dialogue.y+64);return "running";}
+                var leave=Array.FindIndex(dialogue.responses,r=>r.responseKey=="(Leave)");
+                if(leave<0)return End("recipe_channel_unavailable_today");
+                dialogue.selectedResponse=leave;dialogue.receiveLeftClick(0,0);
+                if(!dialogue.transitioning&&ReferenceEquals(Game1.activeClickableMenu,dialogue))return "running";
+                _responses.Clear();_wait=0;_index++;
+                _results.Add(new{source,available=false,reason="recipe_channel_not_in_native_choices"});return "running";
+            }
+            return Dialogue(dialogue);
+        }
         if(Game1.activeClickableMenu is LetterViewerMenu letter){
             _ownedMenu=letter;_results.Add(new{source,content=Read(letter,"mailMessage")?.ToString()});
-            if(letter.readyToClose()){letter.exitThisMenu();_index++;Completed++;}return "running";
+            if(letter.readyToClose()){letter.exitThisMenu();_wait=0;_responses.Clear();_index++;Completed++;}return "running";
         }
         if(Game1.activeClickableMenu is Billboard board){
             _ownedMenu=board;_results.Add(new{source,calendarObserved=true,quest=Game1.questOfTheDay?.questTitle});
-            board.exitThisMenu();_index++;Completed++;return "running";
+            board.exitThisMenu();_wait=0;_index++;Completed++;return "running";
         }
+        if(_wait!=0&&Game1.activeClickableMenu==null){_index++;Completed++;_wait=0;_responses.Clear();return "running";}
         var location=source=="mail"?"Farm":source is "calendar" or "help_wanted" or "special_orders"?"Town":Utility.getHomeOfFarmer(Game1.player).NameOrUniqueName;
         if(Game1.currentLocation.NameOrUniqueName!=location){var move=_nav.Move(location,new(3,8),input,_interact);return move is "blocked" or "unsupported"?End("daily_source_route_unavailable:"+source):"running";}
         GridPoint? tile;
         if(source is "weather" or "fortune" or "recipes"){
             var tv=Game1.currentLocation.furniture.OfType<TV>().FirstOrDefault();if(tv==null)return End("television_not_observed");
-            tile=new((int)tv.TileLocation.X,(int)tv.TileLocation.Y);
-            if(_responses.Count==0)_responses.Enqueue(source=="weather"?"Weather":source=="fortune"?"Fortune":"The Queen of Sauce");
-        }else tile=FindAction(a=>source=="mail"?a.Contains("Mailbox"):source=="calendar"?a.Contains("Billboard"):source=="help_wanted"?a.Contains("Quest")||a.Contains("Billboard"):a.Contains("SpecialOrders"));
+            tile=null;var distance=int.MaxValue;
+            for(var x=(int)tv.TileLocation.X;x<(int)tv.TileLocation.X+tv.getTilesWide();x++)for(var y=(int)tv.TileLocation.Y;y<(int)tv.TileLocation.Y+tv.getTilesHigh();y++){
+                var candidate=new GridPoint(x,y);if(_nav.BestAdjacent(candidate) is not {} approach)continue;
+                var cost=approach.Distance(Navigation.Current);if(cost<distance){tile=candidate;distance=cost;}
+            }
+            if(_responses.Count==0)_responses.Enqueue(source=="weather"?"Weather":source=="fortune"?"Fortune":"The");
+        }else if(source=="mail"){
+            var mailbox=Game1.player.getMailboxPosition();tile=new(mailbox.X,mailbox.Y);
+        }else tile=FindAction(a=>source=="calendar"?a.Contains("Billboard"):source=="help_wanted"?a.Contains("Quest")||a.Contains("Billboard"):a.Contains("SpecialOrders"));
         if(tile==null)return End("daily_source_not_observed:"+source);
-        if(_wait!=0&&Game1.activeClickableMenu==null){_index++;Completed++;_wait=0;return "running";}
         var near=Near(location,tile.Value,input);if(near is "blocked" or "unsupported")return End("daily_source_unreachable");
         if(near=="reached"){_interact(tile.Value);_wait=Environment.TickCount64;}return "running";
     }

@@ -341,18 +341,6 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         var duration = 60;
         switch (command.Skill)
         {
-            case "respond_dialogue":
-                if(Game1.activeClickableMenu is not DialogueBox popup){Emit(command.TaskId,"rejected","dialogue_not_open");return;}
-                var responseKey=args.RootElement.GetProperty("responseKey").GetString()??"";
-                if(popup.isQuestion){
-                    var responseIndex=Array.FindIndex(popup.responses,r=>r.responseKey==responseKey);
-                    if(responseIndex<0){Emit(command.TaskId,"rejected","dialogue_response_unavailable:"+string.Join(",",popup.responses.Select(r=>r.responseKey)));return;}
-                    popup.selectedResponse=responseIndex;popup.receiveLeftClick(0,0);
-                }else{
-                    if(responseKey!=""){Emit(command.TaskId,"rejected","acknowledgement_requires_empty_response_key");return;}
-                    popup.receiveLeftClick(popup.x+64,popup.y+64);
-                }
-                Emit(command.TaskId,"completed",popup.isQuestion?"dialogue_response_selected":"dialogue_acknowledged");return;
             case "face":
                 var directionValue = args.RootElement.GetProperty("direction").GetInt32();
                 if (directionValue < 0 || directionValue > 3) { Emit(command.TaskId, "rejected", "invalid_direction"); return; }

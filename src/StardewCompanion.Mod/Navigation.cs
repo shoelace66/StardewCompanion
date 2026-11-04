@@ -18,6 +18,9 @@ internal sealed class Navigation
     private long _lastMove;
     private int _replans;
     private long _transitionStarted;
+    private string _observedMap = "";
+    private string _previousTransitionFrom = "";
+    private string _previousTransitionTo = "";
     private GridPoint? _breakingTarget;
     private GridPoint? _breakingApproach;
     private long _breakWaitUntil;
@@ -53,7 +56,12 @@ internal sealed class Navigation
         var warp=target.warps.FirstOrDefault(w=>w.TargetName==from);
         return warp==null?null:new GridPoint(warp.X,warp.Y);
     }
-    internal static IReadOnlyList<MapEdge>? Route(string from, string to) => Pathfinding.Dijkstra(from, to, Edges().ToArray(), e => e.From, e => e.To, _ => 100);
+    internal static IReadOnlyList<MapEdge>? Route(string from, string to)
+    {
+        var currentMap=Game1.currentLocation?.NameOrUniqueName??"";var current=Current;
+        return Pathfinding.Dijkstra(from,to,Edges().ToArray(),e=>e.From,e=>e.To,
+            e=>100+(e.From==currentMap?e.Tile.Distance(current):0));
+    }
     internal static GridPoint Current => new(Game1.player.TilePoint.X, Game1.player.TilePoint.Y);
     internal GridPoint SegmentGoal(string destination)
     {
@@ -73,13 +81,22 @@ internal sealed class Navigation
         return !l.isCollidingPosition(new Rectangle(p.X * 64 + 8, p.Y * 64 + 16, 48, 32), Game1.viewport,
             true, 0, false, Game1.player, true, skipCollisionEffects: true);
     }
-    internal void Reset() { _path = null; _map = ""; _replans = 0; _transitionStarted = 0; _breakingTarget=null;_breakingApproach=null;_breakWaitUntil=0;Reason = ""; }
+    internal void Reset() { _path = null; _map = ""; _replans = 0; _transitionStarted = 0; _observedMap="";_previousTransitionFrom="";_previousTransitionTo="";_breakingTarget=null;_breakingApproach=null;_breakWaitUntil=0;Reason = ""; }
     internal void Suspend() { _lastMove = Environment.TickCount64; _lastPosition = Game1.player.Position; }
     // Returns reached / moving / blocked / unsupported. Only emits normal held direction input.
     internal string Move(string location, GridPoint goal, AiInputSimulator input, Action<GridPoint> interact, bool breakNaturalObstacles=false)
     {
         var here = Game1.currentLocation;
         if (!WorldView.Supported(here)) { Reason = "unsupported_current_map"; return "unsupported"; }
+        var currentMap=here.NameOrUniqueName;
+        if(_observedMap=="")_observedMap=currentMap;
+        else if(currentMap!=_observedMap){
+            var from=_observedMap;
+            if(from==_previousTransitionTo&&currentMap==_previousTransitionFrom){
+                _observedMap=currentMap;input.Clear();Reason=$"map_transition_bounced:{from}->{currentMap}";return "blocked";
+            }
+            _previousTransitionFrom=from;_previousTransitionTo=currentMap;_observedMap=currentMap;
+        }
         if (here.NameOrUniqueName != location)
         {
             var route = Route(here.NameOrUniqueName, location);
@@ -172,6 +189,9 @@ internal sealed class Navigation
         var now = Environment.TickCount64; var current = Game1.player.Position;
         if (_map != Game1.currentLocation.NameOrUniqueName || !_goal.Equals(goal))
         { _path = null; _map = Game1.currentLocation.NameOrUniqueName; _goal = goal; _replans = 0; _lastMove = now; _lastPosition = current; _transitionStarted = 0; }
+        var standing=Game1.player.StandingPixel;
+        if(_breakingTarget==null&&Math.Abs(goal.X*64+32-standing.X)<=16&&Math.Abs(goal.Y*64+32-standing.Y)<=16)
+        {_lastMove=now;_lastPosition=current;_replans=0;return "reached";}
         if (Vector2.DistanceSquared(current, _lastPosition) > 64) { _lastMove = now; _lastPosition = current; }
         if (now - _lastMove > 2000)
         {

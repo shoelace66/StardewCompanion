@@ -4,34 +4,81 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text;
 
 namespace StardewCompanion.Core;
 
 public sealed record ModelReply(string Text, JsonObject Message, JsonArray Calls, long ElapsedMs, string Usage);
 public sealed class ModelClient(HttpClient http)
 {
-    public async Task<ModelReply> Complete(ModelSettings settings, JsonArray messages, CancellationToken cancellation, JsonNode? toolChoice = null, bool soloTest=false,CapabilityStatus[]? capabilities=null,JsonArray? toolOverrides=null,Action<JsonObject>? capture=null)
+    public async Task<ModelReply> Complete(ModelSettings settings, JsonArray messages, CancellationToken cancellation, JsonNode? toolChoice = null, bool soloTest=false,CapabilityStatus[]? capabilities=null,JsonArray? toolOverrides=null,Action<JsonObject>? capture=null,int maxTokens=2400)
     {
-        var body=new JsonObject { ["model"]=settings.Model,["messages"]=messages.DeepClone(),["tools"]=(toolOverrides??ToolCatalog.Definitions(soloTest,capabilities)).DeepClone(),["tool_choice"]=toolChoice?.DeepClone()??JsonValue.Create("auto"),["stream"]=false,["max_tokens"]=2400 };
-        var payload=body.ToJsonString();
+        var availableTools=toolOverrides??ToolCatalog.Definitions(soloTest,capabilities);
+        var body=new JsonObject { ["model"]=settings.Model,["messages"]=messages.DeepClone(),["stream"]=false,["max_tokens"]=maxTokens };
+        if(availableTools.Count>0){body["tools"]=availableTools.DeepClone();body["tool_choice"]=toolChoice?.DeepClone()??JsonValue.Create("auto");}
+        var payload=body.ToJsonString(DecisionContextCompression.ReadableJson);
         var timer=Stopwatch.StartNew();
         for(var attempt=0;;attempt++){
         try{
         capture?.Invoke(body);
         using var request=new HttpRequestMessage(HttpMethod.Post,settings.ValidateEndpoint());
+        request.Version=System.Net.HttpVersion.Version11;request.VersionPolicy=HttpVersionPolicy.RequestVersionExact;
+        request.Headers.ConnectionClose=true;request.Headers.ExpectContinue=false;
         request.Headers.Authorization=new AuthenticationHeaderValue("Bearer",settings.GetKey());
         request.Content=new StringContent(payload,System.Text.Encoding.UTF8,"application/json");
-        using var response=await http.SendAsync(request,cancellation);
+        using var attemptTimeout=CancellationTokenSource.CreateLinkedTokenSource(cancellation);attemptTimeout.CancelAfter(TimeSpan.FromSeconds(8));
+        using var response=await http.SendAsync(request,HttpCompletionOption.ResponseHeadersRead,attemptTimeout.Token);
         if(!response.IsSuccessStatusCode)throw new HttpRequestException($"模型请求失败（HTTP {(int)response.StatusCode}）",null,response.StatusCode);
-        var root=JsonNode.Parse(await response.Content.ReadAsStringAsync(cancellation))!;
+        var root=JsonNode.Parse(await response.Content.ReadAsStringAsync(attemptTimeout.Token))!;
         var message=root["choices"]?[0]?["message"]?.AsObject()??throw new InvalidDataException("模型响应没有 message");
         var calls=message["tool_calls"] as JsonArray??new JsonArray();
         return new(message["content"]?.GetValue<string>()??"",message,calls,timer.ElapsedMilliseconds,root["usage"]?.ToJsonString()??"unavailable");
+        }
+        catch(TaskCanceledException ex)when(!cancellation.IsCancellationRequested){
+            if(OperatingSystem.IsWindows())return await CompleteViaWindowsPowerShell(settings,payload,timer,cancellation);
+            if(attempt<2){await Task.Delay(TimeSpan.FromSeconds(attempt+1),cancellation);continue;}
+            throw new TimeoutException("模型请求连续3次在8秒内未完成",ex);
+        }
+        catch(IOException)when(!cancellation.IsCancellationRequested&&OperatingSystem.IsWindows()){
+            return await CompleteViaWindowsPowerShell(settings,payload,timer,cancellation);
+        }
+        catch(HttpRequestException ex)when(!cancellation.IsCancellationRequested&&OperatingSystem.IsWindows()&&ex.StatusCode==null){
+            return await CompleteViaWindowsPowerShell(settings,payload,timer,cancellation);
         }
         catch(HttpRequestException ex)when(attempt<2&&(ex.StatusCode==null||(int)ex.StatusCode==429||(int)ex.StatusCode>=500)){
             await Task.Delay(TimeSpan.FromSeconds(attempt+1),cancellation);
         }
         }
+    }
+
+    private static async Task<ModelReply> CompleteViaWindowsPowerShell(ModelSettings settings,string payload,Stopwatch timer,CancellationToken cancellation)
+    {
+        const string script="""
+        $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::InputEncoding=[Text.Encoding]::UTF8;[Console]::OutputEncoding=[Text.Encoding]::UTF8;
+        try{$r=[Console]::In.ReadToEnd()|ConvertFrom-Json;$json=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($r.payload));$headers=@{Authorization=('Bearer '+$r.key)};
+        $response=Invoke-WebRequest -UseBasicParsing -Uri $r.endpoint -Method Post -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec 45;
+        $decoded=[Text.Encoding]::UTF8.GetString($response.RawContentStream.ToArray())|ConvertFrom-Json;
+        $out=$decoded|ConvertTo-Json -Depth 100 -Compress;[Console]::Out.Write('OK:'+([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($out))))}
+        catch{$out=ConvertTo-Json -InputObject @{error=$_.Exception.Message} -Compress;[Console]::Out.Write('ERR:'+([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($out))));exit 2}
+        """;
+        var start=new ProcessStartInfo{FileName="powershell.exe",UseShellExecute=false,CreateNoWindow=true,RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true,
+            StandardInputEncoding=Encoding.UTF8,StandardOutputEncoding=Encoding.UTF8,StandardErrorEncoding=Encoding.UTF8};
+        start.ArgumentList.Add("-NoProfile");start.ArgumentList.Add("-NonInteractive");start.ArgumentList.Add("-ExecutionPolicy");start.ArgumentList.Add("Bypass");start.ArgumentList.Add("-Command");start.ArgumentList.Add(script);
+        using var process=Process.Start(start)??throw new InvalidOperationException("无法启动 Windows PowerShell 模型传输备用通道");
+        using var registration=cancellation.Register(()=>{try{process.Kill(true);}catch(InvalidOperationException){}});
+        var input=JsonSerializer.Serialize(new{endpoint=settings.ValidateEndpoint().ToString(),key=settings.GetKey(),payload=Convert.ToBase64String(Encoding.UTF8.GetBytes(payload))});
+        await process.StandardInput.WriteAsync(input.AsMemory(),cancellation);process.StandardInput.Close();
+        var outputTask=process.StandardOutput.ReadToEndAsync(cancellation);var errorTask=process.StandardError.ReadToEndAsync(cancellation);
+        await process.WaitForExitAsync(cancellation);var output=(await outputTask).Trim();_ = await errorTask;
+        if(!output.StartsWith("OK:",StringComparison.Ordinal)){
+            var detail="PowerShell model transport failed";
+            if(output.StartsWith("ERR:",StringComparison.Ordinal))try{detail=JsonNode.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(output[4..])))?["error"]?.ToString()??detail;}catch(FormatException){}
+            throw new HttpRequestException(detail);
+        }
+        var root=JsonNode.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(output[3..])))!;
+        var message=root["choices"]?[0]?["message"]?.AsObject()??throw new InvalidDataException("模型响应没有 message");
+        var calls=message["tool_calls"] as JsonArray??new JsonArray();
+        return new(message["content"]?.GetValue<string>()??"",message,calls,timer.ElapsedMilliseconds,root["usage"]?.ToJsonString()??"unavailable");
     }
 
     public async Task<ModelReply> TestToolCalling(ModelSettings settings, CancellationToken cancellation)
@@ -84,10 +131,10 @@ public static class ToolCatalog
             Tool("read_mailbox","读取本玩家未读邮件的正文模板和附件描述；只读，不领取附件或改变原版已读状态"),
             Tool("observe","读取当前原生游戏观察"),
             Tool("inspect_target","检查当前地图格子与箱子内容",("x","integer","横坐标"),("y","integer","纵坐标")),
-            Tool("inspect_route","检查当前可用的步行连接",("location","string","机器地点标识")),
+            Tool("inspect_route","检查当前可用的步行连接；exitTile属于fromMap且会触发离图，arrivalTile属于toMap。跨地图时直接把go_to的location和坐标设为最终目的地图及到达点，不要先go_to当前地图的出口格再调用下一张地图",("location","string","机器地点标识")),
             Tool("inspect_area","只读检查当前地图指定区域的地形、障碍和可达性",("location","string","地点标识"),("x","integer","左上横坐标"),("y","integer","左上纵坐标"),("width","integer","宽1到32"),("height","integer","高1到32")),
             Tool("read_context_history","按需读取当前存档的本地历史；不会操作游戏。plans空id列计划索引，指定id读步骤与回执；memory空id列记忆，指定id读原文；receipts指定任务id分页读处理格与掉落",("source","string","plans、memory、receipts或diagnostics"),("id","string","计划ID、记忆ID或任务ID；查询索引时为空字符串"),("offset","integer","从0开始的分页偏移"),("limit","integer","每页1到8项")),
-            Tool("go_to","正常四方向步行到可达格子；collect=true时顺路拾取路径周围可见掉落物，单个掉落物拾取失败不会中断寻路",("location","string","机器地点标识"),("x","integer","横坐标"),("y","integer","纵坐标"),("collect","boolean","是否顺路采集，默认false"),("pickupRadius","integer","采集范围距实际A*路线的格数，0到8，默认2"),("breakNaturalObstacles","boolean","是否允许破坏自然障碍以缩短路径，由模型决定")),
+            Tool("go_to","普通步行并自动跨地图到达最终地点和格子；location和坐标应是最终目的地，经过地图出口由导航处理，不要把当前地图exitTile作为中间目标（触发出口会立即切图）。collect=true时顺路拾取路径周围可见掉落物，单个掉落物拾取失败不会中断寻路",("location","string","最终目的地图标识；跨地图时直接填写目标地图"),("x","integer","最终地图中的到达横坐标"),("y","integer","最终地图中的到达纵坐标"),("collect","boolean","是否顺路采集，默认false"),("pickupRadius","integer","采集范围距实际A*路线的格数，0到8，默认2"),("breakNaturalObstacles","boolean","是否允许破坏自然障碍以缩短路径，由模型决定")),
             Tool("respond_dialogue","读取当前弹窗后按明确选项继续；普通提示用空responseKey确认",("responseKey","string","必须是当前弹窗实际提供的responseKey；非选项提示填空字符串")),
             Tool("fish_at","在指定岸边和抛竿方向连续钓鱼；本地控制原版鱼条，结果只按原版鱼获确认",("location","string","已观察的钓鱼地点机器标识"),("x","integer","玩家应站立的岸边格X"),("y","integer","玩家应站立的岸边格Y"),("direction","string","抛竿朝向"),("casts","integer","最多抛竿次数1到20"),("treasurePolicy","string","try或ignore，由模型选择是否争取宝箱")),
             Tool("fight_enemies","在当前普通矿井连续战斗，按原版武器碰撞与怪物状态核验；不自动吃食物或撤退",("maxKills","integer","击杀目标数1到30"),("maxGameMinutes","integer","游戏时间上限1到600"),("weaponId","string","明确使用的武器QualifiedItemId")),
@@ -95,7 +142,7 @@ public static class ToolCatalog
             Tool("follow_player","跟随联机玩家，在不支持地图外等待",("playerId","string","玩家机器标识")),
             Tool("refill_water","在当前地图寻找可达水源补水"),Tool("return_home","步行回自己的小屋"),Tool("sleep","自动从当前位置步行回自己的农舍、前往床并等待原版换日；无需先单独调用return_home或go_to"),
             Tool("cancel_task","取消当前任务，不代表批准任何请求"),
-            Tool("ask_user","有重要决定或缺少信息时询问；未回答不代表批准",("question","string","中文问题")),
+            Tool("ask_user","仅缺少必要授权或观察与记忆均无法取得关键信息时询问；已授权的日常经营自行选择；未回答不代表批准",("question","string","中文问题")),
             Tool("remember_experience","记录可复用的工作经验，包括条件、依据和下一步",("text","string","条件、经验、来源及下一步核验")),
             Tool("update_project","更新项目下一步建议",("projectId","string","项目机器 ID"),("nextStep","string","基于当前观察的下一步建议"))
         };
@@ -147,8 +194,7 @@ public static class ToolCatalog
     {
         var primitives=PrimitiveDefinitions(soloTest);
         var planningProperties=new JsonObject{["planId"]=Field("string","unique planning id"),["goal"]=Field("string","public subgoal"),["basis"]=Field("string","observed facts and public rationale")};
-        foreach(var field in new[]{"assumptions","successCriteria","pending"})planningProperties[field]=new JsonObject{["type"]="array",["items"]=new JsonObject{["type"]="string"}};
-        primitives.Add(new JsonObject{["type"]="function",["function"]=new JsonObject{["name"]="save_plan",["description"]="更新持续工作目标、依据和下一步；已完成成果由Core依据执行回执维护",["parameters"]=new JsonObject{["type"]="object",["properties"]=planningProperties,["required"]=new JsonArray("planId","goal","basis","assumptions","successCriteria","pending"),["additionalProperties"]=false}}});
+        primitives.Add(new JsonObject{["type"]="function",["function"]=new JsonObject{["name"]="save_plan",["description"]="记录当前目标和依据；后续步骤与进度由Core根据工具计划及执行回执维护",["parameters"]=new JsonObject{["type"]="object",["properties"]=planningProperties,["required"]=new JsonArray("planId","goal","basis"),["additionalProperties"]=false}}});
         var tools=new JsonArray();var grouped=BusinessCapabilities.Groups.ToDictionary(g=>g,_=>new JsonArray());
         foreach(var t in primitives){
             var f=t!["function"]!;var name=f["name"]!.GetValue<string>();
@@ -167,15 +213,12 @@ public static class ToolCatalog
         }
         foreach(var group in BusinessCapabilities.Groups){var variants=grouped[group];if(variants.Count==0)continue;var title=BusinessCapabilities.GroupTitle(group);
             tools.Add(new JsonObject{["type"]="function",["function"]=new JsonObject{
-                ["name"]="group_"+group,["description"]=title+"：在本组选择1到8个按序执行的子技能；失败时停止后续步骤",
+                ["name"]="group_"+group,["description"]=title+"：在本组选择1到8个按序执行的子技能；失败时停止后续步骤。只填写planId和steps，不添加计划说明字段",
                 ["parameters"]=new JsonObject{["type"]="object",["properties"]=new JsonObject{
                     ["planId"]=Field("string","本次计划唯一标识，相同标识不会重复执行"),
                     ["encounterPolicy"]=new JsonObject{["type"]="string",["enum"]=new JsonArray("fight","avoid","interrupt"),["description"]="遇到普通矿井怪物时的策略；省略时默认interrupt"},
                     ["steps"]=new JsonObject{["type"]="array",["minItems"]=1,["maxItems"]=8,["items"]=new JsonObject{["oneOf"]=variants}}},
                     ["required"]=new JsonArray("planId","steps"),["additionalProperties"]=false}}});
-            var parameters=tools.Last()!["function"]!["parameters"]!["properties"]!.AsObject();
-            foreach(var field in new[]{"goal","basis","assumptions","successCriteria","pending"})parameters[field]=planningProperties[field]!.DeepClone();
-            parameters["pending"]!["maxItems"]=8;
         }
         tools.Add(Tool("wait_for_change","没有有效工作时等待状态变化或到期",("seconds","integer","1到120秒"),("reason","string","明确等待什么条件")));
         tools.Last()!["function"]!["parameters"]!["properties"]!["seconds"]!["minimum"]=1;

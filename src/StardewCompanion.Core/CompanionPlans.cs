@@ -8,9 +8,11 @@ public sealed partial class CompanionRuntime
 {
     private Task? _planTask;
     private CancellationTokenSource? _planCancellation;
-    private readonly HashSet<string> _planIds=new();
+    private readonly Dictionary<string,string> _planIds=new();
     private long _decisionDue;
     private long _decisionRevision;
+    private long _waitDue;
+    private int _decisionRequested;
     private string _waitFingerprint="";
     private string _lastActionFingerprint="";
     private string _lastActionState="";
@@ -22,29 +24,40 @@ public sealed partial class CompanionRuntime
     private static string FactFingerprint(GameObservation s)
     {
         var w=JsonNode.Parse(s.WorldView);
-        return JsonSerializer.Serialize(new{s.GameDay,s.Location,s.Tile,s.Stamina,s.Health,inventory=w?["inventory"],soil=w?["soil"],forage=w?["forage"],obstacles=w?["naturalObstacles"],chests=w?["chests"],water=w?["water"]});
+        return JsonSerializer.Serialize(new{s.GameDay,s.TimeOfDay,s.Location,s.Tile,s.Stamina,s.Health,s.Menu,s.MenuContext,inventory=w?["inventory"],soil=w?["soil"],forage=w?["forage"],obstacles=w?["naturalObstacles"],chests=w?["chests"],water=w?["water"]});
     }
     private void WakeDecision(long revision=0)
-    {_decisionDue=Environment.TickCount64+200;_decisionRevision=Math.Max(_decisionRevision,revision);}
+    {_decisionDue=Environment.TickCount64+200;_decisionRevision=Math.Max(_decisionRevision,revision);Interlocked.Exchange(ref _decisionRequested,1);}
     private object StartPlan(JsonObject args,string decision)
     {
         var s=_bridge.Observation!;
         if(Mode=="plan_only"){SaveWorkPlan(args,args["steps"],false);return new{status="saved_plan_only",executed=false};}
         if(!_resumed||_planTask is {IsCompleted:false}||s.ActiveTaskId!="")throw new InvalidOperationException("当前忙碌或已暂停，不能提交新计划");
-        var plan=ShortPlan.Parse(args);
+        var normalized=(JsonObject)args.DeepClone();
+        var work=WorkState();
+        if(normalized["goal"] is null){var goal=work["currentObjective"]?.ToString();if(string.IsNullOrWhiteSpace(goal))goal=PlayerGoal["objective"]?.ToString();normalized["goal"]=JsonValue.Create(string.IsNullOrWhiteSpace(goal)?"执行明确操作":goal);}
+        normalized["basis"]??=JsonValue.Create($"{s.Location} {s.TimeOfDay/100:D2}:{s.TimeOfDay%100:D2}; day {s.GameDay}; observed revision {s.Revision}");
+        normalized["assumptions"]??=new JsonArray();
+        normalized["successCriteria"]??=new JsonArray();
+        normalized["pending"]??=new JsonArray((normalized["steps"]?.AsArray()??new JsonArray()).Select(step=>(JsonNode?)JsonValue.Create(step?["skill"]?.ToString()??"next step")).ToArray());
+        var plan=ShortPlan.Parse(normalized);
         if(s.Menu=="DialogueBox"&&plan.Steps[0].Skill!="respond_dialogue")
             throw new InvalidOperationException("当前有未处理的对话弹窗；计划第一步必须按menuContext中的responseKey调用respond_dialogue");
-        SaveWorkPlan(args,args["steps"],false);
         var key=_scope+":"+_session+":"+plan.Id;
-        if(_memory.Get(_scope,"plan_seen:"+_session+":"+plan.Id)!=null||!_planIds.Add(key)){
+        var memoryKey="plan_seen:"+_session+":"+plan.Id;
+        var currentFacts=FactFingerprint(s);
+        var priorFacts=_planIds.GetValueOrDefault(key)??_memory.Get(_scope,memoryKey);
+        if(priorFacts==currentFacts){
             _decisionDue=Environment.TickCount64+5000;
             var rejected=new{planId=plan.Id,status="duplicate_not_executed",reason="plan_id_already_submitted",originalFailure=_lastFailureReason,results=Array.Empty<object>(),unexecuted=plan.Steps};
             RecordActionFeedback(rejected);return rejected;
         }
-        _memory.Set(_scope,"plan_seen:"+_session+":"+plan.Id,"accepted");
+        SaveWorkPlan(normalized,normalized["steps"],false);
+        _planIds[key]="running";
+        _memory.Set(_scope,memoryKey,"running");
         _scopedPlanSkills=plan.Steps.Select(s=>s.Skill).Distinct().ToArray();_expandedTools=false;
         _planCancellation?.Dispose();_planCancellation=CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-        _planTask=ExecutePlan(plan,decision,_scope,_session,s.GameDay,_planCancellation.Token,DecisionContextCompression.Text(args,"goal"));
+        _planTask=ExecutePlan(plan,decision,_scope,_session,s.GameDay,_planCancellation.Token,DecisionContextCompression.Text(normalized,"goal"));
         return new{status="accepted",planId=plan.Id,steps=plan.Steps.Length};
     }
     private async Task ExecutePlan(ShortPlan plan,string decision,string scope,string session,int day,CancellationToken ct,string goal)
@@ -81,9 +94,13 @@ public sealed partial class CompanionRuntime
         catch(Exception ex){status="stopped";reason=SafeError(ex);if(scope==_scope&&session==_session&&_resumed)await _bridge.Control("cancel");}
         finally
         {
+            var finalFacts=_bridge.Observation is {} finalState?FactFingerprint(finalState):"";
+            _planIds[scope+":"+session+":"+plan.Id]=finalFacts;
+            _memory.Set(scope,"plan_seen:"+session+":"+plan.Id,finalFacts);
             var summary=new{planId=plan.Id,goal,status,reason,originalFailure=_lastFailureReason,results,unexecuted=plan.Steps.Skip(results.Count).ToArray()};
-            Decisions.Write(scope,session,decision,"plan_finished",summary);
             RecordPlanEvidence(scope,plan.Id,summary,status=="completed"?"batch_completed":status);
+            if(scope==_scope&&session==_session)RetireWorkingBatch(plan.Id);
+            Decisions.Write(scope,session,decision,"plan_finished",summary);
             if(scope==_scope&&session==_session){_lastPlan=summary;RecordActionFeedback(summary);WakeDecision();}
         }
     }

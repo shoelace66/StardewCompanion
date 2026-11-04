@@ -16,7 +16,7 @@ internal static class BusinessAvailability
         Name=c.Name,Group=c.Group,Implemented=HasNativeAdapter(c.Name),Validated=false,
         State=HasNativeAdapter(c.Name)?"available_unverified":"unavailable",Reason=HasNativeAdapter(c.Name)?"native_adapter_present_requires_gameplay_validation":"native_adapter_not_implemented"}).ToArray();
     private static bool HasNativeAdapter(string name)=>name is
-        "survey_area" or "cultivate_plot" or "maintain_plot" or "harvest_and_replant" or "gather_resource" or "plant_trees" or "forage_route" or
+        "claim_starter_gift" or "survey_area" or "cultivate_plot" or "maintain_plot" or "harvest_and_replant" or "gather_resource" or "plant_trees" or "forage_route" or
         "collect_outputs" or "service_machines" or "craft_items" or "cook_recipes" or "craft_and_place" or "install_irrigation" or
         "organize_storage" or "prepare_loadout" or "recover" or "end_day" or "travel" or "tend_animals" or "care_for_pets" or "manage_livestock" or
         "purchase_items" or "sell_items" or "upgrade_tool" or "collect_upgraded_tool" or "order_building" or "modify_building" or

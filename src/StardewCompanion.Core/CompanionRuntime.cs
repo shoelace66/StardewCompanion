@@ -12,7 +12,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
     private readonly MemoryStore _memory;
     private readonly string _logPath;
     private readonly CancellationTokenSource _lifetime=new();
-    private sealed record QueuedInstruction(string Scope,string Session,string Text,bool SeasonMaintenance=false);
+    private sealed record QueuedInstruction(string Scope,string Session,string Text,bool SeasonMaintenance=false,string? ConversationMessageId=null);
     private readonly ConcurrentQueue<QueuedInstruction> _messages=new();
     private readonly ConcurrentQueue<TaskResult> _recentResults=new();
     private readonly HashSet<string> _capturedPromptKinds=new(StringComparer.Ordinal);
@@ -23,6 +23,8 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
     public bool PlanningEnabled {get;set;}=true;
     public int? AutonomousTrialEndDay {get;set;}
     private bool _trialFinished;
+    private int _emptyDecisionRetries;
+    private long _lastOfflineSnapshotAt;
     private CancellationTokenSource? _request;
     private Task? _loop;
     private readonly object _lifecycleGate=new();
@@ -49,6 +51,8 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
     public CompanionRuntime(IGameBridge bridge,MemoryStore memory,ModelSettings settings,HttpClient http,string logPath)
     {
         _bridge=bridge;_memory=memory;Settings=settings;_model=new(http);_logPath=logPath;
+        _scope=_memory.Get("_global","last_scope")??_memory.LatestChatScope()??"";
+        if(_scope!="")_session=_memory.Get(_scope,"last_session")??"";
         Decisions=new(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(logPath))!,"decisions.jsonl"));
         bridge.Observed+=OnObserved;bridge.Result+=OnResult;
     }
@@ -57,6 +61,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
         lock(_lifecycleGate)
         {
             ObjectDisposedException.ThrowIf(_disposeTask!=null,this);
+            if(_scope!=""&&!_bridge.Connected&&LatestPendingConversation() is {} pending)_messages.Enqueue(pending);
             _loop??=Run();
         }
     }
@@ -64,6 +69,9 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
     {
         if(!ControlModePolicy.CanControl(state))return;
         var scope=state.SaveId+":"+state.PlayerId;
+        _memory.Set("_global","last_scope",scope);
+        _memory.Set(scope,"last_session",state.SessionId);
+        SaveOfflineSnapshot(scope,state);
         if(state.SessionId!=_session||scope!=_scope)
         {
             _resumed=false;_planningPaused=true;Invalidate();_taskProjects.Clear();_taskDecisions.Clear();_queryFacts.Clear();_capturedPromptKinds.Clear();_lastPlan=null;_decisionRevision=0;_lastActionFingerprint="";_lastActionState="";_lastFailureReason="";_unchangedFailures=0;
@@ -83,8 +91,8 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
             var previousSeason=_season;
             var counts=_memory.EventSummary(scope,_session,previousDay);
             if(counts.Count>0)_memory.Add(scope,"episode",JsonSerializer.Serialize(new{day=previousDay,session=_session,verifiedTaskCounts=counts,source="actual_execution_results",scope="session_observed"}),"game_task_results",previousDay,"session_observed");
-            var success=_recentResults.Where(r=>r.Status=="completed"&&r.Completed>0).Select(SeasonProgressEntry).ToArray();
-            _day=state.GameDay;_season=CalendarSeason(state);Invalidate(false);_memory.Reconcile(scope,_session,_day);
+            var success=JsonNode.Parse(_memory.Get(scope,"verified_day_results:"+_session+":"+previousDay)??"[]");
+            _day=state.GameDay;_season=CalendarSeason(state);Invalidate(false);_memory.Reconcile(scope,_session,_day);RetireWorkingDay();
             _memory.Set(scope,"season_maintenance",JsonSerializer.Serialize(new{endedDay=previousDay,endedSeason=previousSeason,currentSeason=_season,successfulResults=success}));
             while(_recentResults.TryDequeue(out _)){}
             _triggerKind="new_day";Trace("day_changed",new{previousDay,day=_day});
@@ -100,6 +108,8 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
         Trace("task_result",result,decision);
         if(result.Status is "completed" or "partial" or "failed" or "cancelled" or "rejected")
         {
+            if(_triggerKind=="no_action_retry"&&!ToolCatalog.Queries.Contains(result.Skill)){_retryAfter=0;_emptyDecisionRetries=0;}
+            if(result.Status=="completed"&&result.Completed>0&&!ToolCatalog.Queries.Contains(result.Skill))RecordSuccessfulDayResult(result);
             if(!ToolCatalog.Queries.Contains(result.Skill)&&!result.Reason.EndsWith("_ack"))WakeDecision(result.ObservationRevision);
             if(!result.Reason.EndsWith("_ack") && !ToolCatalog.Queries.Contains(result.Skill))
             {
@@ -156,10 +166,13 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
     public void SendMessage(string message)
     {
         if(string.IsNullOrWhiteSpace(message))return;
-        if(_scope=="")throw new InvalidOperationException("请先连接游戏，再发送工作指令");
+        if(_scope==""){
+            _scope=_memory.Get("_global","last_scope")??_memory.LatestChatScope()??"offline:general";
+            _session=_memory.Get(_scope,"last_session")??"";
+        }
         var scope=_scope;var session=_session;
-        QueueConversation(message);
-        Invalidate(false);WakeDecision();_messages.Enqueue(new(scope,session,message));_memory.Chat(scope,"user",message);ChatReceived?.Invoke("玩家",message);
+        var conversationMessageId=QueueConversation(message);
+        Invalidate(false);WakeDecision();_messages.Enqueue(new(scope,session,message,false,conversationMessageId));_memory.Chat(scope,"user",message);ChatReceived?.Invoke("玩家",message);
         Trace("player_message",new{text=message});
         if(_resumed&&_bridge.Observation is {ActiveTaskId.Length:>0})_ = InterruptActiveTaskForPlayerMessage(scope,session);
         if(PendingQuestion!="") {PendingQuestion="";_memory.Set(_scope,"pendingQuestion","");}
@@ -207,7 +220,10 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                 try
                 {
                     var s=_bridge.Observation;
-                    if(!_bridge.Connected){if(_resumed){_resumed=false;_planningPaused=true;Invalidate();Status="游戏连接中断；重新连接后点击继续";Changed?.Invoke();}}
+                    if(!_bridge.Connected){if(_resumed){_resumed=false;_planningPaused=true;Invalidate();Status="游戏连接中断；重新连接后点击继续";Changed?.Invoke();}
+                        if((_thinking==null||_thinking.IsCompleted)&&_messages.TryDequeue(out var offline)&&offline.Scope==_scope)
+                            _thinking=AnswerOffline(offline);
+                    }
                     else if(!_bridge.Fresh) { Status="游戏正在加载或状态已过期，等待新观察";Changed?.Invoke(); }
                     else if(s?.WorldReady==true)
                     {
@@ -216,13 +232,15 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                             if(!_trialFinished){_trialFinished=true;await Pause();Trace("trial_completed",new{gameDay=s.GameDay,targetDays=end,reason="configured_native_days_elapsed",s.TestRunId});}
                             await Task.Delay(200,_lifetime.Token);continue;
                         }
-                        if(_waitFingerprint!=""&&FactFingerprint(s)!=_waitFingerprint){_waitFingerprint="";_triggerKind="wait_condition_changed";WakeDecision();}
+                        if(_waitFingerprint!=""&&FactFingerprint(s)!=_waitFingerprint){_waitFingerprint="";_waitDue=0;_triggerKind="wait_condition_changed";WakeDecision();}
+                        else if(_waitDue>0&&Environment.TickCount64>=_waitDue){_waitFingerprint="";_waitDue=0;_triggerKind="wait_timeout";WakeDecision();}
+                        if(_retryAfter>0&&Environment.TickCount64>=_retryAfter){_retryAfter=0;if(_triggerKind!="no_action_retry")_triggerKind="model_retry";WakeDecision();}
                         var sleeping=s.Menu is "ReadyCheckDialog" or "SaveGameMenu" or "ShippingMenu";
                         if(PlanningEnabled&&(_thinking==null||_thinking.IsCompleted)&&_planTask is not {IsCompleted:false}&&!sleeping)
                         {
                             if((_resumed||Mode=="plan_only"&&!_planningPaused)&&_messages.TryDequeue(out var queued))
-                            { if(queued.Scope==_scope&&queued.Session==_session)_thinking=Think(queued.Text,queued.Scope,queued.Session,queued.SeasonMaintenance); }
-                            else if((_resumed||Mode=="plan_only"&&!_planningPaused)&&s.ActiveTaskId==""&&PendingQuestion==""&&Environment.TickCount64>=_retryAfter&&Environment.TickCount64>=_decisionDue&&s.Revision>=_decisionRevision)
+                            { Interlocked.Exchange(ref _decisionRequested,0);if(queued.Scope==_scope&&queued.Session==_session)_thinking=Think(queued.Text,queued.Scope,queued.Session,queued.SeasonMaintenance); }
+                            else if((_resumed||Mode=="plan_only"&&!_planningPaused)&&s.ActiveTaskId==""&&PendingQuestion==""&&Environment.TickCount64>=_retryAfter&&Environment.TickCount64>=_decisionDue&&s.Revision>=_decisionRevision&&Interlocked.Exchange(ref _decisionRequested,0)==1)
                                 _thinking=Think("根据当前工作状态与游戏观察决定下一步。");
                         }
                     }
@@ -232,6 +250,52 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
             }
         }
         catch(OperationCanceledException){}
+    }
+    private void SaveOfflineSnapshot(string scope,GameObservation state)
+    {
+        var now=Environment.TickCount64;if(now-_lastOfflineSnapshotAt<5000)return;_lastOfflineSnapshotAt=now;
+        try{
+            var world=JsonNode.Parse(state.WorldView) as JsonObject??new();
+            var snapshot=new JsonObject{["observedAtUtc"]=DateTimeOffset.UtcNow.ToString("o"),["gameDay"]=state.GameDay,["timeOfDay"]=state.TimeOfDay,
+                ["location"]=state.Location,["tile"]=JsonSerializer.SerializeToNode(state.Tile),["stamina"]=state.Stamina,["health"]=state.Health,
+                ["money"]=world["money"]?.DeepClone(),["inventory"]=world["inventory"]?.DeepClone(),["calendar"]=world["decisionFacts"]?["calendar"]?.DeepClone(),
+                ["weather"]=world["weather"]?.DeepClone()};
+            _memory.Set(scope,"last_known_game_state",snapshot.ToJsonString());
+        }catch(JsonException){}
+    }
+    private async Task AnswerOffline(QueuedInstruction queued)
+    {
+        var scope=queued.Scope;var session=queued.Session;var decisionId=Guid.NewGuid().ToString("N");
+        var epoch=Interlocked.Read(ref _epoch);
+        _request=CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);_request.CancelAfter(TimeSpan.FromSeconds(50));var cancellation=_request.Token;
+        try{
+            var goal=PlayerGoal;var work=WorkState();
+            var goalContext=new JsonObject{["objective"]=goal["objective"]?.DeepClone(),["completionCondition"]=goal["completionCondition"]?.DeepClone(),
+                ["priorities"]=goal["priorities"]?.DeepClone(),["restrictions"]=goal["restrictions"]?.DeepClone()};
+            var workflow=new JsonObject{["currentObjective"]=work["currentObjective"]?.DeepClone(),["objectiveBasis"]=work["objectiveBasis"]?.DeepClone(),
+                ["next"]=work["next"]?.DeepClone(),["confirmedMilestones"]=new JsonArray((work["confirmedMilestones"] as JsonArray??new()).TakeLast(4).Select(m=>m?.DeepClone()).ToArray())};
+            var memories=_memory.Relevant(scope,queued.Text).Where(m=>m.Kind is "agreement" or "routine" or "project")
+                .Take(4).Select(m=>new JsonObject{["kind"]=m.Kind,["text"]=m.Text.Length>700?m.Text[..700]:m.Text,["state"]=m.State}).ToArray();
+            var context=new JsonObject{["kind"]="offline_chat",["gameConnected"]=false,["currentMessage"]=queued.Text,
+                ["playerGoal"]=goalContext,["workflow"]=workflow,["lastKnownGameState"]=JsonNode.Parse(_memory.Get(scope,"last_known_game_state")??"null"),
+                ["relevantMemories"]=new JsonArray(memories)};
+            static string Clip(string? value,int max)=>string.IsNullOrWhiteSpace(value)?"（无记录）":value.Length<=max?value:value[..max]+"…";
+            var prompt=string.Join("\n",new[]{"存档目标："+Clip(goal["objective"]?.ToString(),90),
+                "最近流程："+Clip(work["currentObjective"]?.ToString(),90),
+                "记录的下一步："+string.Join("；",(work["next"] as JsonArray??new()).Take(2).Select(v=>Clip(v?.ToString(),45))),
+                "玩家问题："+queued.Text});
+            var messages=new JsonArray{new JsonObject{["role"]="system",["content"]=DecisionInstructions.OfflineChat},
+                new JsonObject{["role"]="user",["content"]=prompt}};
+            Trace("offline_chat_context",context,decisionId);Trace("model_request",new{kind="offline_chat",model=Settings.Model,toolCount=0},decisionId);
+            var reply=await _model.Complete(Settings,messages,cancellation,toolOverrides:new JsonArray(),maxTokens:512);
+            if(epoch!=Interlocked.Read(ref _epoch)||scope!=_scope||session!=_session)return;
+            Trace("model_reply",new{kind="offline_chat",text=reply.Text,toolCalls=reply.Calls.Count,elapsedMs=reply.ElapsedMs,usage=reply.Usage},decisionId);
+            if(queued.ConversationMessageId is {Length:>0} messageId)ConfirmConversationMessage(messageId);
+            Say(string.IsNullOrWhiteSpace(reply.Text)?"我收到了你的消息。当前没有可用的文字回复，稍后可以再问一次。":reply.Text);
+            Status="已回复（游戏未连接；未执行游戏操作）";Changed?.Invoke();
+        }catch(OperationCanceledException){Trace("offline_chat_cancelled",new{},decisionId);}
+        catch(Exception ex){var error=SafeError(ex);Trace("offline_chat_error",new{error},decisionId);Status="离线聊天失败："+error;Changed?.Invoke();}
+        finally{_request?.Dispose();_request=null;}
     }
     private async Task Think(string instruction,string? expectedScope=null,string? expectedSession=null,bool seasonMaintenance=false)
     {
@@ -267,12 +331,14 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                 var reply=await _model.Complete(Settings,messages,cancellation,soloTest:false,capabilities:state.Capabilities,
                     toolOverrides:promptTools, capture:body=>Trace("model_prompt_capture",new{requestId,round,kind=seasonMaintenance?"sleep_maintenance":"daily_action",gameDay=state.GameDay,
                         prompt=body,feedbackRevision=seasonMaintenance?null:delivery["revision"]?.DeepClone(),eventIds=seasonMaintenance?Array.Empty<string?>():delivery["pendingEvents"]?.AsArray().Select(e=>e?["id"]?.ToString()).ToArray()},decisionId));
+                _retryAfter=0;
                 Log(new{kind="model",elapsedMs=reply.ElapsedMs,usage=reply.Usage});
                 if(epoch!=Interlocked.Read(ref _epoch)||scope!=_scope||session!=_session){Trace("decision_discarded",new{reason="context_changed"},decisionId);return;}
                 if(!seasonMaintenance&&(reply.Text!=""||reply.Calls.Count>0)){ConfirmAwarenessDelivery(delivery);ConfirmConversation(conversation);_triggerKind="state_changed";}
                 Trace("model_reply",new{requestId,round,text=reply.Text,calls=reply.Calls,elapsedMs=reply.ElapsedMs,usage=reply.Usage},decisionId);
                 if(reply.Text!="")Say(reply.Text);
                 if(reply.Calls.Count==0){
+                    if(seasonMaintenance)break;
                     Trace("empty_decision",new{reason="no_tool_selected"},decisionId);
                     if(seasonMaintenance)context["instruction"]="维护本日季节计划进度。";
                     else context["trigger"]=new JsonObject{["kind"]="no_action_selected",["gameDay"]=state.GameDay,["reason"]="请选择下一步工具"};
@@ -290,7 +356,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                     try{arguments=JsonNode.Parse(rawArguments) as JsonObject??throw new JsonException("Expected a JSON object");}
                     catch(JsonException ex){
                         var invalid=new{status="rejected",reason="invalid_tool_arguments_json",line=ex.LineNumber,column=ex.BytePositionInLine,
-                            correction="工具arguments必须是合法JSON对象；中文文本须使用双引号，assumptions、successCriteria、pending必须是字符串数组；请修正后重试，本次没有执行该工具"};
+                            correction="工具arguments必须是合法JSON对象；所有文本值用双引号。组合技能仅传planId和steps；save_plan仅传planId、goal、basis。请修正后重试，本次没有执行该工具"};
                         Trace("tool_rejected",new{name,result=invalid,rawArguments},decisionId);
                         messages.Add(new JsonObject{["role"]="tool",["tool_call_id"]=call!["id"]!.GetValue<string>(),["content"]=DecisionContextCompression.Serialize(invalid)});
                         continue;
@@ -330,9 +396,11 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                         }
                         else if(name=="wait_for_change")
                         {
+                            var current=_bridge.Observation!;
+                            if(current.Menu!="")throw new InvalidOperationException("modal_menu_blocks_wait:"+current.Menu+":请先使用respond_dialogue或关闭当前界面；菜单打开时游戏时间不会推进");
                             var seconds=arguments["seconds"]?.GetValue<int>()??30;
                             if(seconds is <1 or >120)throw new InvalidOperationException("等待必须为1到120秒");
-                            _waitFingerprint=FactFingerprint(_bridge.Observation!);_decisionDue=Environment.TickCount64+seconds*1000;
+                            _waitFingerprint=FactFingerprint(current);_waitDue=Environment.TickCount64+seconds*1000;
                             _expandedTools=false;
                             result=new{status="waiting",seconds,reason=arguments["reason"]?.GetValue<string>()};mutation=true;
                         }
@@ -345,7 +413,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                                 while(_queryFacts.Count>4)_queryFacts.Dequeue();
                             }
                         }
-                        else if(name=="ask_user") {PendingQuestion=arguments["question"]!.GetValue<string>();_memory.Set(scope,"pendingQuestion",PendingQuestion);result=new{status="pending",approved=false};Changed?.Invoke();}
+                        else if(name=="ask_user") {PendingQuestion=arguments["question"]!.GetValue<string>();_memory.Set(scope,"pendingQuestion",PendingQuestion);result=new{status="pending",approved=false};mutation=true;Changed?.Invoke();}
                         else if(name=="remember_experience") {var id=_memory.Add(scope,"routine",arguments["text"]!.GetValue<string>(),"model_inference",_day);result=new{id,state="unverified"};}
                         else if(name=="update_project")
                         {
@@ -390,20 +458,42 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                         modelResult=new{status=observed.Status,reason=observed.Reason,observationRevision=observed.ObservationRevision,observationUpdated=true,reference="world"};
                     }
                     messages.Add(new JsonObject{["role"]="tool",["tool_call_id"]=call!["id"]!.GetValue<string>(),["content"]=DecisionContextCompression.Serialize(modelResult)});
+                    if(mutation||PendingQuestion!="")break;
                 }
-                if(mutation)break;
+                if(mutation){_emptyDecisionRetries=0;break;}
+                if(round==2&&reply.Calls.Count>0&&PendingQuestion==""&&_waitDue==0&&_bridge.Observation?.ActiveTaskId==""&&_planTask is not {IsCompleted:false}){
+                    _triggerKind="tool_followup";WakeDecision(_bridge.Observation?.Revision??state.Revision);
+                }
             }
         }
         catch(OperationCanceledException){Trace("decision_cancelled",new{reason=epoch==Interlocked.Read(ref _epoch)?"timeout":"context_changed"},decisionId);if(epoch==Interlocked.Read(ref _epoch)){Status="模型请求超时；当前本地任务继续";_retryAfter=Environment.TickCount64+60000;Changed?.Invoke();}}
         catch(Exception ex){Status="模型暂不可用，60秒后自动重试："+SafeError(ex);_retryAfter=Environment.TickCount64+60000;Log(new{kind="model_error",error=ex.GetType().Name});Trace("model_error",new{error=SafeError(ex)},decisionId);Changed?.Invoke();}
-        finally{if(_planTask is not {IsCompleted:false}&&Environment.TickCount64>=_decisionDue)_decisionDue=Environment.TickCount64+1000;Trace("decision_finished",new{},decisionId);_request?.Dispose();_request=null;}
+        finally{
+            if(_planTask is not {IsCompleted:false}&&Environment.TickCount64>=_decisionDue)_decisionDue=Environment.TickCount64+1000;
+            if(seasonMaintenance&&epoch==Interlocked.Read(ref _epoch)&&scope==_scope&&session==_session&&_resumed&&_retryAfter==0){
+                _triggerKind="season_maintenance_completed";WakeDecision(_bridge.Observation?.Revision??0);
+            }
+            else if(!seasonMaintenance&&epoch==Interlocked.Read(ref _epoch)&&_resumed&&PendingQuestion==""&&_waitDue==0&&_retryAfter==0
+                &&_bridge.Observation?.ActiveTaskId==""&&_planTask is not {IsCompleted:false}&&Volatile.Read(ref _decisionRequested)==0){
+                var delaySeconds=Math.Min(60,5*(1<<Math.Min(_emptyDecisionRetries++,4)));
+                _triggerKind="no_action_retry";_retryAfter=Environment.TickCount64+delaySeconds*1000;
+                Status=$"模型未选择下一步工具，{delaySeconds}秒后重新规划";Trace("no_action_retry_scheduled",new{delaySeconds},decisionId);Changed?.Invoke();
+            }
+            Trace("decision_finished",new{},decisionId);_request?.Dispose();_request=null;
+        }
     }
     private void Say(string text){_memory.Chat(_scope,"assistant",text);ChatReceived?.Invoke("AI",text);}
     private void Trace(string kind,object data,string decision=""){
         Decisions.Write(_scope,_session,decision,kind,data);
         if(_scope!="")_memory.ArchiveDiagnostic(_scope,_session,kind,decision,JsonSerializer.Serialize(data));
     }
-    private static string SafeError(Exception e)=>e is HttpRequestException or InvalidOperationException or ArgumentException?e.Message:e.GetType().Name;
+    private static string SafeError(Exception e)=>e switch{
+        HttpRequestException {InnerException:{ } inner} http=>$"{http.Message} ({inner.GetType().Name}: {inner.Message})",
+        HttpRequestException http=>http.Message,
+        IOException io=>io.Message,
+        TimeoutException timeout=>timeout.Message,
+        InvalidOperationException or ArgumentException=>e.Message,
+        _=>e.GetType().Name};
     private void Log(object value){try{Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(_logPath))!);lock(_logPath)File.AppendAllText(_logPath,JsonSerializer.Serialize(new{at=DateTime.UtcNow,data=value})+Environment.NewLine);}catch(IOException){}}
     public ValueTask DisposeAsync()
     {

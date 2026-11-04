@@ -121,8 +121,9 @@ internal sealed partial class NativeWorkExecutor
             if(_target is not {} target)return Finish("region_native_operations_finished");
             var move=Near(location,target,input);if(move=="blocked"||move=="unsupported")return End("target_unreachable");if(move!="reached")return "running";
             if(_action=="remove_dead"){
-                if(Game1.currentLocation.terrainFeatures.Pairs.Any(p=>Math.Abs(p.Key.X-target.X)<=3&&Math.Abs(p.Key.Y-target.Y)<=3&&p.Value is HoeDirt {crop:not null} soil&&!soil.crop.dead.Value))return End("live_crop_protected_from_scythe_area");
-                if(_wait==0){var tool=Game1.player.Items.OfType<MeleeWeapon>().FirstOrDefault(w=>w.isScythe());if(tool==null)return End("scythe_missing");Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(tool);Face(target);input.Tool=true;_wait=Environment.TickCount64+800;return "running";}
+                var tool=Game1.player.Items.OfType<MeleeWeapon>().FirstOrDefault(w=>w.isScythe());if(tool==null)return End("scythe_missing");
+                if(AreaActionExecutor.HasScytheHarvestRisk(target,tool))return End("harvestable_crop_protected_from_scythe_area");
+                if(_wait==0){Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(tool);Face(target);input.Tool=true;_wait=Environment.TickCount64+800;return "running";}
                 if(Environment.TickCount64<_wait)return "running";
                 if(Game1.currentLocation.terrainFeatures.TryGetValue(new(target.X,target.Y),out var terrain)&&terrain is HoeDirt {crop:not null})return End("dead_crop_clear_not_verified");
             }else if(!PlaceItem(Text("itemId"),target))return End("fertilizer_native_rejected");

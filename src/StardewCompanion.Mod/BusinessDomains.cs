@@ -14,6 +14,7 @@ internal sealed partial class BusinessExecutor
     private IEnumerable<WorkUnit> Domain()
     {
         switch(_skill){
+            case "claim_starter_gift":yield return Native(_skill,_args);break;
             case "purchase_items":case "sell_items":
                 if(_skill=="sell_items"&&Text("channel")=="shipping")yield return Native("shipping",_args);
                 else yield return Native(_skill,_args);

@@ -8,7 +8,39 @@ public sealed record SeasonPlanRecord(int Year,string Season,string Goal,string[
 
 public sealed partial class CompanionRuntime
 {
-    private JsonNode? GetSeasonPlan()=>JsonNode.Parse(_memory.Get(_scope,"season_plan")??"null");
+    private JsonNode? GetSeasonPlan()
+    {
+        var raw=_memory.Get(_scope,"season_plan")??"null";
+        if(JsonNode.Parse(raw) is not JsonObject stored)return null;
+        var canonical=new JsonObject();
+        foreach(var key in new[]{"year","season","goal","constraints","successCriteria","progress","createdAt"})
+            canonical[key]=DecisionContextCompression.Get(stored,key)?.DeepClone();
+        string Repair(string value){
+            if(!value.Any(c=>c is >= '\u0080' and <= '\u009f')||value.Any(c=>c>'\u00ff'))return value;
+            try{var decoded=new System.Text.UTF8Encoding(false,true).GetString(System.Text.Encoding.Latin1.GetBytes(value));
+                return decoded.Any(c=>c is >= '\u4e00' and <= '\u9fff')?decoded:value;
+            }catch(System.Text.DecoderFallbackException){return value;}
+        }
+        foreach(var key in canonical.Select(p=>p.Key).ToArray()){
+            if(canonical[key] is JsonValue value&&value.GetValueKind()==JsonValueKind.String)canonical[key]=Repair(value.GetValue<string>());
+            else if(canonical[key] is JsonArray array)for(var i=0;i<array.Count;i++)if(array[i] is JsonValue item&&item.GetValueKind()==JsonValueKind.String)array[i]=Repair(item.GetValue<string>());
+        }
+        var normalized=canonical.ToJsonString();
+        if(raw!=normalized){
+            _memory.Set(_scope,"season_plan_before_normalization:"+DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),raw);
+            _memory.Set(_scope,"season_plan",normalized);Trace("season_plan_normalized",new{source="stored_plan",originalPreserved=true});
+        }
+        return canonical;
+    }
+
+    private void RecordSuccessfulDayResult(TaskResult result)
+    {
+        var key="verified_day_results:"+_session+":"+_day;
+        var results=JsonNode.Parse(_memory.Get(_scope,key)??"[]")!.AsArray();
+        var receipt=JsonSerializer.SerializeToNode(SeasonProgressEntry(result));
+        if(results.Any(r=>r?["details"]?["taskId"]?.ToString()==result.TaskId))return;
+        results.Add(receipt);_memory.Set(_scope,key,results.ToJsonString());
+    }
 
     private static string CalendarSeason(GameObservation state)
     {
@@ -57,13 +89,13 @@ public sealed partial class CompanionRuntime
         var progress=args["progress"] is JsonArray p&&p.All(v=>v?.GetValueKind()==JsonValueKind.String)?p.Select(v=>v!.GetValue<string>()).ToArray():Array.Empty<string>();
         var year=Math.Max(1,(state.GameDay-1)/112+1);
         if(current!=null){
-            var previous=JsonSerializer.Deserialize<SeasonPlanRecord>(current.ToJsonString())!;
+            var previous=JsonSerializer.Deserialize<SeasonPlanRecord>(current.ToJsonString(),new JsonSerializerOptions{PropertyNameCaseInsensitive=true})!;
             var reviews=JsonNode.Parse(_memory.Get(_scope,"season_plan_history")??"[]") as JsonArray??new JsonArray();
             reviews.Add(new JsonObject{["plan"]=JsonSerializer.SerializeToNode(previous),["review"]=review});
             _memory.Set(_scope,"season_plan_history",reviews.ToJsonString());
         }
         var record=new SeasonPlanRecord(year,targetSeason,RequiredText("goal",1000),RequiredArray("constraints"),RequiredArray("successCriteria"),progress,DateTimeOffset.UtcNow.ToString("O"));
-        _memory.Set(_scope,"season_plan",JsonSerializer.Serialize(record));
+        _memory.Set(_scope,"season_plan",JsonSerializer.Serialize(record,new JsonSerializerOptions{PropertyNamingPolicy=JsonNamingPolicy.CamelCase}));
         Trace("season_plan_created",new{record.Year,record.Season,record.Goal,record.Constraints,record.SuccessCriteria});
         return new{status="created",record,fieldsLocked=true};
     }

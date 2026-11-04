@@ -14,7 +14,12 @@ namespace StardewCompanion.Mod;
 
 internal sealed class RoutineExecutor
 {
-    internal static readonly string[] Skills = new[]{ "go_to", "follow_player", "return_home", "sleep", "water_area", "harvest_area", "refill_water", "forage_area", "clear_area", "till_area", "plant_area", "deposit_items", "withdraw_items", "fish_at", "fight_enemies", "mine_travel" }.Concat(BusinessCapabilities.All.Where(c=>!c.Query).Select(c=>c.Name)).ToArray();
+    internal static readonly string[] Skills = new[]{ "go_to", "follow_player", "return_home", "sleep", "respond_dialogue", "water_area", "harvest_area", "refill_water", "forage_area", "clear_area", "till_area", "plant_area", "deposit_items", "withdraw_items", "fish_at", "fight_enemies", "mine_travel" }.Concat(BusinessCapabilities.All.Where(c=>!c.Query).Select(c=>c.Name)).ToArray();
+    private DialogueBox? _responseSource;
+    private string _responseText="";
+    private bool _responseWasQuestion;
+    private bool _responseClicked;
+    private long _responseDeadline;
     private readonly BusinessExecutor? _business;
     private readonly AreaActionExecutor? _areaAction;
     private readonly SpecialActivityExecutor? _activity;
@@ -94,8 +99,23 @@ internal sealed class RoutineExecutor
     internal string Tick(AiInputSimulator input)
     {
         var now = Environment.TickCount64;
+        if(_skill=="respond_dialogue")return RespondDialogue(now);
+        var sleeping=_skill=="sleep"||_skill=="end_day"&&Flag("sleep")||_skill=="recover"&&Text("method")=="sleep";
+        if(sleeping&&Game1.activeClickableMenu is ShippingMenu shipping){
+            if(_menuWait==0)_menuWait=now;
+            if(now-_menuWait>60000)return End("shipping_confirmation_timeout");
+            shipping.receiveKeyPress(Keys.Escape);Phase="confirm_shipping_and_save";return "running";
+        }
+        if(sleeping&&Game1.activeClickableMenu is LevelUpMenu level){
+            if(level.isProfessionChooser)return End("profession_choice_required");
+            var button=level.okButton.bounds.Center;level.receiveLeftClick(button.X,button.Y);Phase="confirm_level_up";return "running";
+        }
+        if(sleeping&&Game1.activeClickableMenu is SaveGameMenu){Phase="waiting_for_native_save";return "running";}
         if(Game1.Date.TotalDays!=_day){
-            if(_skill=="sleep"||_skill=="end_day"&&Flag("sleep")||_skill=="recover"&&Text("method")=="sleep"){Reason="new_day_observed";return "completed";}
+            if(sleeping){
+                if(Game1.activeClickableMenu!=null||!Game1.player.CanMove||Game1.endOfNightMenus.Count>0){Phase="waiting_for_native_save";return "running";}
+                Reason="new_day_observed";return "completed";
+            }
             return End("native_day_changed_replan_required:原版已换日，请根据新状态决定后续工作");
         }
         if(_skill!="fight_enemies"&&Game1.currentLocation is MineShaft&&Game1.currentLocation.characters.OfType<Monster>().Any(m=>m.Health>0))
@@ -119,7 +139,6 @@ internal sealed class RoutineExecutor
         if(_activity!=null){var status=_activity.Tick(input);Completed=_activity.Completed;Reason=_activity.Reason;Phase=_activity.Phase;return status;}
         if(_business!=null){var status=_business.Tick(input);Completed=_business.Completed;Reason=_business.Reason;Phase=_business.Phase;return status;}
         if(_areaAction!=null){var status=_areaAction.Tick(input);Completed=_areaAction.Completed;Reason=_areaAction.Reason;Phase=_areaAction.Phase;return status;}
-        if (_skill == "sleep" && Game1.Date.TotalDays != _day) { Reason = "new_day_observed"; return "completed"; }
         if (Game1.eventUp || !Game1.player.CanMove || Game1.player.UsingTool || Game1.activeClickableMenu != null)
         {
             _nav.Suspend();
@@ -492,6 +511,28 @@ internal sealed class RoutineExecutor
         Completed += transferred;
         Phase = "transfer_items";
         if(Completed>=Number("count")){Reason="transfer_verified";return "completed";}return "running";
+    }
+    private string RespondDialogue(long now)
+    {
+        var popup=Game1.activeClickableMenu as DialogueBox;
+        if(_responseClicked&&(!ReferenceEquals(popup,_responseSource)||popup!.getCurrentString()!=_responseText||popup.isQuestion!=_responseWasQuestion)){
+            Reason=_responseWasQuestion?"dialogue_response_selected":"dialogue_acknowledged";return "completed";
+        }
+        if(popup==null)return End("dialogue_not_open");
+        if(_responseDeadline==0){_responseDeadline=now+10000;_responseSource=popup;_responseText=popup.getCurrentString();_responseWasQuestion=popup.isQuestion;}
+        if(now>=_responseDeadline)return End("dialogue_response_not_verified");
+        Phase="waiting_for_dialogue_response";
+        if(popup.transitioning||popup.safetyTimer>0)return "running";
+        if(popup.characterIndexInDialogue<popup.getCurrentString().Length-1){popup.receiveLeftClick(popup.x+64,popup.y+64);return "running";}
+        var key=_args.GetProperty("responseKey").GetString()??"";
+        if(popup.isQuestion){
+            var index=Array.FindIndex(popup.responses,r=>r.responseKey==key);
+            if(index<0)return End("dialogue_response_unavailable:"+string.Join(",",popup.responses.Select(r=>r.responseKey)));
+            popup.selectedResponse=index;
+        }else if(key!="")return End("acknowledgement_requires_empty_response_key");
+        popup.receiveLeftClick(popup.x+64,popup.y+64);
+        _responseClicked=popup.transitioning||!ReferenceEquals(Game1.activeClickableMenu,popup)||popup.getCurrentString()!=_responseText||popup.isQuestion&&popup.selectedResponse==-1;
+        return "running";
     }
     private static int MoveStack(Item source, int amount, IList<Item> destination, int capacity)
     {

@@ -23,8 +23,8 @@ foreach($file in @('StardewCompanion.Mod.dll','StardewCompanion.Protocol.dll','S
 }
 Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\玩家快速开始.md') -Destination $app -Force
 @{
-    endpoint='https://api.deepseek.com/chat/completions'
-    model='deepseek-chat'
+    endpoint='https://api.xiaomimimo.com/v1/chat/completions'
+    model='mimo-v2.6-pro'
     apiKey='在 Companion 设置中填写；密钥会按当前 Windows 用户加密保存在本机。'
     gamePath=$GamePath
 }|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $app 'model-settings.example.json') -Encoding UTF8

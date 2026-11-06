@@ -6,8 +6,8 @@ namespace StardewCompanion.Core;
 
 public sealed class ModelSettings
 {
-    public string Endpoint { get; set; } = "https://api.deepseek.com/chat/completions";
-    public string Model { get; set; } = "deepseek-chat";
+    public string Endpoint { get; set; } = "https://api.xiaomimimo.com/v1/chat/completions";
+    public string Model { get; set; } = "mimo-v2.6-pro";
     public string ApiKeyDpapi { get; set; } = "";
     public string GamePath { get; set; } = @"F:\SteamLibrary\steamapps\common\Stardew Valley";
     public static ModelSettings Load(string path)

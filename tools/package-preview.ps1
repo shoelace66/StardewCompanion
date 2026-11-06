@@ -18,7 +18,7 @@ $target=Join-Path $app 'Mods\StardewCompanion.Bridge'
 New-Item -ItemType Directory -Path $target -Force|Out-Null
 foreach($file in @('StardewCompanion.Mod.dll','StardewCompanion.Protocol.dll','manifest.json')){Copy-Item -LiteralPath (Join-Path $mod $file) -Destination (Join-Path $target $file) -Force}
 Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\玩家快速开始.md') -Destination $app -Force
-@{endpoint='https://api.deepseek.com/chat/completions';model='deepseek-chat';apiKey='在程序设置中填写';gamePath=$GamePath}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $app 'model-settings.example.json') -Encoding UTF8
+@{endpoint='https://api.xiaomimimo.com/v1/chat/completions';model='mimo-v2.6-pro';apiKey='在程序设置中填写';gamePath=$GamePath}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $app 'model-settings.example.json') -Encoding UTF8
 $hashes=Get-ChildItem -LiteralPath $app -File -Recurse|Sort-Object FullName|ForEach-Object{[pscustomobject]@{path=$_.FullName.Substring($app.Length+1).Replace('\','/');sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash}}
 $hashes|ConvertTo-Json -Depth 4|Set-Content -LiteralPath (Join-Path $app 'SHA256SUMS.json') -Encoding UTF8
 $artifacts=Join-Path $repoRoot 'artifacts';New-Item -ItemType Directory -Path $artifacts -Force|Out-Null

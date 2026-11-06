@@ -225,7 +225,8 @@ LLM 并不直接看到整个游戏进程，也不会持续“盯着”屏幕。�
 - Stardew Valley 1.6.15。
 - SMAPI 4.5.2，供 AI 客户端使用；真人房主保持纯原版客户端。
 - .NET SDK 10.0.403。仓库 `global.json` 固定此 SDK，并允许滚动至兼容补丁版本。
-- 玩家可访问的 OpenAI 兼容 Chat Completions API 及有效模型配置。
+- 玩家可访问的 OpenAI 兼容 Chat Completions API 及有效模型配置。默认配置为 Xiaomi MiMo `mimo-v2.6-pro`，地址 `https://api.xiaomimimo.com/v1/chat/completions`；可在 Companion 设置页更换。
+- 使用 MiMo 时，请为本项目自建应用 API 调用配置可用于 API 调用的 `sk-` 密钥。MiMo Token Plan 的 `tp-` / `ttp-` 凭据仅适用于订阅支持的编程工具，不能用于本项目这类自建应用后端；具体套餐与区域地址以 MiMo 控制台为准。
 - 同一农场的房主与 AI 客户端必须能通过游戏支持的联机网络互相连接；首次创建/加入房间需要在游戏界面操作。
 
 桌面预览包采用 Windows x64 自包含发布，附带 .NET 运行时；《星露谷物语》和 SMAPI 仍需玩家自行安装。源码构建模组需要本机游戏目录中的游戏与 SMAPI 程序集。

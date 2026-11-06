@@ -62,8 +62,8 @@ internal static class Program
             await Wait(() => Text(window, "服务已就绪"), "retry did not start the service");
             Require(await Healthy(data), "retried service was not reachable");
 
-            var model = Descendants(window).OfType<TextBox>().Single(t => t.Text == "deepseek-chat");
-            var endpoint = Descendants(window).OfType<TextBox>().Single(t => t.Text == "https://api.deepseek.com/chat/completions");
+            var model = Descendants(window).OfType<TextBox>().Single(t => t.Text == "mimo-v2.6-pro");
+            var endpoint = Descendants(window).OfType<TextBox>().Single(t => t.Text == "https://api.xiaomimimo.com/v1/chat/completions");
             model.Text = "desktop-recovered-model";
             Click(window, "保存设置");
             await Wait(() => ModelSettings.Load(path).Model == "desktop-recovered-model", "settings were not saved");

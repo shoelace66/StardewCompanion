@@ -14,7 +14,7 @@ internal static class NavigationTargets
     internal static Target? Resolve(JsonElement args,out object? failure)
     {
         failure=null;
-        var name=args.TryGetProperty("name",out var named)?named.GetString()!.Trim():null;
+        var name=args.TryGetProperty("name",out var named)?named.GetString()?.Trim():null;
         var filter=args.TryGetProperty("location",out var located)?located.GetString():null;
         if(name==null){
             var map=Game1.getLocationFromName(filter!);
@@ -34,8 +34,10 @@ internal static class NavigationTargets
         var matches=candidates.Where(c=>(filter==null||c.Location==filter||c.Kind=="npc"&&npcMatches.Length==1)&&(c.Id==name||c.Name==name))
             .DistinctBy(c=>(c.Kind,c.Id,c.Location)).ToArray();
         if(matches.Length==1)return matches[0];
+        var offered=matches.Length>0?matches:candidates.Where(c=>filter==null||c.Location==filter).ToArray();
         failure=new{reason=matches.Length==0?"navigation_name_unknown_or_unavailable":"navigation_name_ambiguous",requested=name,location=filter,
-            candidates=matches.Length>0?matches:candidates.Where(c=>filter==null||c.Location==filter).ToArray(),
+            candidates=offered.Take(12).ToArray(),candidateCount=offered.Length,
+            releaseCondition=matches.Length==0?"use_an_observed_map_or_target_name":"choose_an_exact_identity_and_map",
             meaning="exact map names, requested live NPC identity, and authorized chest names; availability still requires native navigation"};
         return null;
     }

@@ -24,7 +24,7 @@ public sealed partial class CompanionRuntime
     }
     private void WakeDecision(long revision=0)
     {_decisionDue=Environment.TickCount64+200;_decisionRevision=Math.Max(_decisionRevision,revision);Interlocked.Exchange(ref _decisionRequested,1);}
-    private object StartPlan(JsonObject args,string decision)
+    private object StartPlan(JsonObject args,string decision,JsonObject decisionContext)
     {
         var s=_bridge.Observation!;
         if(Mode=="plan_only"){SaveWorkPlan(args,args["steps"],false);return new{status="saved_plan_only",executed=false};}
@@ -57,14 +57,17 @@ public sealed partial class CompanionRuntime
         SaveWorkPlan(normalized,normalized["steps"],false);
         _planIds[key]="running";
         _memory.Set(_scope,memoryKey,"running");
+        DiscardContinuation();
         _planCancellation?.Dispose();_planCancellation=CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-        _planTask=ExecutePlan(plan,decision,_scope,_session,s.GameDay,_planCancellation.Token,DecisionContextCompression.Text(normalized,"goal"));
+        var continuationInput=plan.Steps.Length>=2?BuildContinuationInput(decisionContext,plan):null;
+        _planTask=ExecutePlan(plan,decision,_scope,_session,s.GameDay,_planCancellation.Token,DecisionContextCompression.Text(normalized,"goal"),continuationInput,Interlocked.Read(ref _epoch));
         return new{status="accepted",planId=plan.Id,steps=plan.Steps.Length};
     }
-    private async Task ExecutePlan(ShortPlan plan,string decision,string scope,string session,int day,CancellationToken ct,string goal)
+    private async Task ExecutePlan(ShortPlan plan,string decision,string scope,string session,int day,CancellationToken ct,string goal,JsonObject? continuationInput,long epoch)
     {
         // Yield so StartPlan publishes the running task before any synchronous callback can complete it.
         await Task.Yield();
+        var continuation=continuationInput==null?null:StartContinuation(continuationInput,plan.Id,decision,epoch,day,ct);
         var results=new List<object>();var status="completed";var reason="";
         Trace("plan_started",new{planId=plan.Id,steps=plan.Steps,source="model"},decision);
         try
@@ -92,7 +95,8 @@ public sealed partial class CompanionRuntime
         catch(Exception ex){status="stopped";reason=SafeError(ex);if(scope==_scope&&session==_session&&_resumed)await _bridge.Control("cancel");}
         finally
         {
-            if(status!="completed"&&scope==_scope&&session==_session)DiscardContinuation(failed:true);
+            StopContinuation(continuation);
+            if(status!="completed"&&scope==_scope&&session==_session)DiscardContinuation();
             var finalFacts=_bridge.Observation is {} finalState?FactFingerprint(finalState):"";
             _planIds[scope+":"+session+":"+plan.Id]=finalFacts;
             _memory.Set(scope,"plan_seen:"+session+":"+plan.Id,finalFacts);

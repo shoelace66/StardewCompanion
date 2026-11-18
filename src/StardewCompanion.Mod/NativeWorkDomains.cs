@@ -174,24 +174,24 @@ internal sealed partial class NativeWorkExecutor
             else _results.Add(new{itemId=id,added,money=Game1.player.Money});
             if(paid!=stock.Price)return ShopItemFailure("purchase_payment_not_verified",menu,request);
         }else{
-            var quality=request.GetProperty("quality").GetInt32();var owned=Game1.player.Items.Where(i=>i?.QualifiedItemId==id&&i.Quality==quality).Sum(i=>i.Stack);
+            var quality=request.GetProperty("quality").GetInt32();var owned=SaleQuantity(id,quality);
+            var retain=request.GetProperty("retain").GetInt32();
             if(menu.currency!=0)return End("shop_sale_currency_not_supported_by_gold_contract");
-            if(owned<=request.GetProperty("retain").GetInt32())return End("sale_retain_limit");
-            var item=Item(id,quality);if(item==null||item is Tool||item.modData.ContainsKey("StardewCompanion/Protected"))return End("sale_item_missing_or_protected");
-            var slot=menu.inventory.inventory[Game1.player.Items.IndexOf(item)].bounds.Center;var before=Count(id);
-            var moneyBeforeSale=Game1.player.Money;ClickMenu(menu,slot.X,slot.Y,true);var removed=before-Count(id);var income=Game1.player.Money-moneyBeforeSale;
+            if(owned==0)return End("sale_item_missing");
+            var item=SaleItem(id,quality);if(item==null)return End("sale_item_protected");
+            if(owned<=retain)return End("sale_retain_limit");
+            var slot=menu.inventory.inventory[Game1.player.Items.IndexOf(item)].bounds.Center;
+            var moneyBeforeSale=Game1.player.Money;ClickMenu(menu,slot.X,slot.Y,true);
+            var remaining=SaleQuantity(id,quality);var removed=owned-remaining;var income=Game1.player.Money-moneyBeforeSale;
             if(removed<=0){
                 var nativeReason=GameEventTracker.LastDialogueCapture is {} refusal&&refusal.Revision>_promptRevisionBefore?refusal.Text:null;
                 _results.Add(new{itemId=id,quality,requested=wanted-_before,removed=0,income=0,reason="shop_item_not_accepted",nativePrompt=nativeReason});
                 return End("shop_item_not_accepted");
             }
-            if(income<0||removed>wanted-_before)return End("shop_sale_not_verified");
-            if(income==0){
-                Completed+=removed;_results.Add(new{itemId=id,itemName=item.DisplayName,quality,removed,income,reason="sale_gold_not_verified",money=Game1.player.Money});
-                return End("shop_sale_item_removed_without_gold_verification");
-            }
-            _results.Add(new{itemId=id,itemName=item.DisplayName,quality,removed,income,money=Game1.player.Money,settled=true});
             _before+=removed;Completed+=removed;
+            _results.Add(new{itemId=id,itemName=item.DisplayName,quality,removed,income,remaining,retain,money=Game1.player.Money,settled=income>0});
+            if(income<=0)return End("shop_sale_item_removed_without_gold_verification");
+            if(removed!=1||remaining<retain||_before>wanted)return End("shop_sale_quantity_not_verified");
         }
         return "running";
     }
@@ -207,18 +207,27 @@ internal sealed partial class NativeWorkExecutor
         if(_index>=items.Length){menu.exitThisMenu();return Finish("items_shipped_pending_night_settlement");}
         var entry=items[_index];var id=entry.GetProperty("itemId").GetString()!;var quality=entry.GetProperty("quality").GetInt32();
         if(_before>=entry.GetProperty("count").GetInt32()){_before=0;_index++;return "running";}
-        var item=Item(id,quality);var count=Game1.player.Items.Where(i=>i?.QualifiedItemId==id&&i.Quality==quality).Sum(i=>i.Stack);
-        if(item==null||item is Tool||item.modData.ContainsKey("StardewCompanion/Protected"))return End("shipping_item_missing_or_protected");
-        if(count<=entry.GetProperty("retain").GetInt32())return End("shipping_retain_limit");
+        var count=SaleQuantity(id,quality);var retain=entry.GetProperty("retain").GetInt32();
+        if(count==0)return End("shipping_item_missing");
+        var item=SaleItem(id,quality);if(item==null)return End("shipping_item_protected");
+        if(count<=retain)return End("shipping_retain_limit");
         var shipped=Game1.getFarm().getShippingBin(Game1.player);
         var shippedBefore=shipped.Where(i=>i?.QualifiedItemId==id&&i.Quality==quality).Sum(i=>i.Stack);
-        var slot=menu.inventory.inventory[Game1.player.Items.IndexOf(item)].bounds.Center;var before=Count(id);
-        ClickMenu(menu,slot.X,slot.Y,true);var transferred=before-Count(id);
+        var slot=menu.inventory.inventory[Game1.player.Items.IndexOf(item)].bounds.Center;
+        ClickMenu(menu,slot.X,slot.Y,true);
+        var remaining=SaleQuantity(id,quality);var transferred=count-remaining;
         var shippingGain=shipped.Where(i=>i?.QualifiedItemId==id&&i.Quality==quality).Sum(i=>i.Stack)-shippedBefore;
+        _results.Add(new{itemId=id,itemName=item.DisplayName,quality,transferred,shippingGain,remaining,retain,
+            settled=false,meaning="in_shipping_bin_pending_night_settlement"});
         if(transferred<=0||shippingGain!=transferred)return End("shipping_transfer_not_verified");
-        _results.Add(new{itemId=id,quality,transferred,settled=false,meaning="in_shipping_bin_pending_night_settlement"});
-        Completed+=transferred;_before+=transferred;return "running";
+        Completed+=transferred;_before+=transferred;
+        if(transferred!=1||remaining<retain||_before>entry.GetProperty("count").GetInt32())return End("shipping_quantity_not_verified");
+        return "running";
     }
+    private static int SaleQuantity(string id,int quality)=>Game1.player.Items
+        .Where(i=>i?.QualifiedItemId==id&&i.Quality==quality).Sum(i=>i.Stack);
+    private static Item? SaleItem(string id,int quality)=>Game1.player.Items
+        .FirstOrDefault(i=>i?.QualifiedItemId==id&&i.Quality==quality&&ExecutionTargets.IsSaleItem(i));
     private bool CleanupDomain()
     {
         if(_eventTrade?.Cleanup()==false)return false;

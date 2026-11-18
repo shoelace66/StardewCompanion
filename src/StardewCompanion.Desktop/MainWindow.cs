@@ -14,6 +14,7 @@ public sealed class MainWindow:Window
 {
     private readonly string _data;
     private readonly int? _trialDays;
+    private readonly string? _workspace;
     private GameBridge _bridge=new();
     private CompanionRuntime? _runtime;
     private ModelSettings _settings=new();
@@ -40,9 +41,10 @@ public sealed class MainWindow:Window
     private Task? _initializing;
     private string _loadedScope="";
     private DecisionMonitorWindow? _monitor;
-    public MainWindow(string data,int? trialDays=null)
+    private SpringTrialWindow? _spring;
+    public MainWindow(string data,int? trialDays=null,string? workspace=null)
     {
-        _data=data;_trialDays=trialDays;Title="星露谷 · AI 协同陪玩（开发预览）";Width=1100;Height=800;MinWidth=850;MinHeight=650;
+        _data=data;_trialDays=trialDays;_workspace=workspace;Title="星露谷 · AI 协同陪玩（开发预览）";Width=1100;Height=800;MinWidth=850;MinHeight=650;
         FontFamily=new FontFamily("Microsoft YaHei UI");FontSize=14;Background=new SolidColorBrush(Color.FromRgb(242,245,238));
         var root=new DockPanel{Margin=new Thickness(20)};Content=root;
         var title=new TextBlock{Text="一起经营这座农场",FontSize=25,FontWeight=FontWeights.SemiBold,Margin=new Thickness(0,0,0,14)};DockPanel.SetDock(title,Dock.Top);root.Children.Add(title);
@@ -51,6 +53,17 @@ public sealed class MainWindow:Window
         controls.Children.Add(Button("仅规划",()=>NeedRuntime().SetMode("plan_only")));controls.Children.Add(Button("自主执行",()=>NeedRuntime().SetMode("autonomous")));
         controls.Children.Add(Button("打开原版房主",()=>Launch(false)));controls.Children.Add(Button("打开 AI 客户端",()=>Launch(true)));
         controls.Children.Add(Button("LLM 交互调试",()=>{OpenDecisionMonitor();return Task.CompletedTask;}));
+        if(workspace!=null)controls.Children.Add(Button("一键春季测试",async()=>{
+            if(_spring!=null){_spring.Activate();return;}
+            var active=SpringTrialWindow.FindActiveRun(workspace);
+            var window=active==null
+                ?new SpringTrialWindow(workspace,ModelSettings.Load(Path.Combine(_data,"model.credentials.json")))
+                :new SpringTrialWindow(active);
+            _spring=window;
+            window.Closed+=(_,_)=>_spring=null;
+            window.Show();
+            if(active==null)await window.Start();
+        }));
         DockPanel.SetDock(controls,Dock.Top);root.Children.Add(controls);
         var state=new StackPanel{Margin=new Thickness(0,0,0,12)};state.Children.Add(_status);state.Children.Add(_startupHint);state.Children.Add(_world);DockPanel.SetDock(state,Dock.Top);root.Children.Add(state);
         var tabs=new TabControl();root.Children.Add(tabs);
@@ -165,7 +178,9 @@ public sealed class MainWindow:Window
         }
         catch(Exception e)
         {
-            _status.Text="启动失败，自动执行未启动："+e.Message+"。处理后可在设置页重试启动。";
+            _status.Text=_workspace!=null&&SpringTrialWindow.FindActiveRun(_workspace)!=null
+                ?"春季测试正在运行。点击“一键春季测试”查看本轮进度。"
+                :"启动失败，自动执行未启动："+e.Message+"。处理后可在设置页重试启动。";
             try { await StopServices(); }
             catch(Exception cleanup){_status.Text+=" 清理失败："+cleanup.Message;}
             finally { _bridge=new(); }

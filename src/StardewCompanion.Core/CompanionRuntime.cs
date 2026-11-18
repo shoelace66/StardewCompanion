@@ -36,6 +36,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
     private long _epoch;
     private long _lastDecision;
     private long _retryAfter;
+    private const int ModelRetryDelaySeconds=5;
     private bool _resumed;
     private bool _planningPaused=true;
     private string _scope="";
@@ -43,7 +44,8 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
     public ModelSettings Settings {get;set;}
     public string Status {get;private set;}="等待 AI 游戏连接";
     public bool Running=>_resumed;
-    public string PendingQuestion {get;private set;}="";
+    private string _pendingQuestion="";
+    public string PendingQuestion {get=>_namingWait?.Manual==true?ManualNamingPrompt:_pendingQuestion;private set=>_pendingQuestion=value;}
     public event Action? Changed;
     public event Action<string,string>? ChatReceived;
     public MemoryStore Memory=>_memory;
@@ -109,9 +111,10 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
         var wakeDecision=false;
         var decision=_taskDecisions.GetValueOrDefault(result.TaskId)??"";
         Trace("task_result",result,decision);
+        if(result.Skill==PetNaming.Skill)return; // The menu transition wakes the scheduler.
         if(result.Status is "completed" or "partial" or "failed" or "cancelled" or "rejected")
         {
-            if((result.Status!="completed"||IsNoProgressResult(result))&&!ToolCatalog.Queries.Contains(result.Skill))DiscardContinuation(failed:true);
+            if((result.Status!="completed"||IsNoProgressResult(result))&&!ToolCatalog.Queries.Contains(result.Skill))DiscardContinuation();
             FinishAction(result);
             if(_triggerKind=="no_action_retry"&&!ToolCatalog.Queries.Contains(result.Skill)){_retryAfter=0;_emptyDecisionRetries=0;}
             if((result.Status is "completed" or "partial")&&result.Completed>0&&!ToolCatalog.Queries.Contains(result.Skill))RecordSuccessfulDayResult(result);
@@ -179,6 +182,11 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
         }
         var scope=_scope;var session=_session;
         var conversationMessageId=QueueConversation(message);
+        if(_bridge.Connected&&_bridge.Fresh&&_bridge.Observation?.Menu==PetNaming.Menu){
+            _messages.Enqueue(new(scope,session,message,false,conversationMessageId));
+            _memory.Chat(scope,"user",message);ChatReceived?.Invoke("玩家",message);
+            Trace("player_message",new{text=message});return;
+        }
         Invalidate(false);WakeDecision();_messages.Enqueue(new(scope,session,message,false,conversationMessageId));_memory.Chat(scope,"user",message);ChatReceived?.Invoke("玩家",message);
         Trace("player_message",new{text=message});
         if(_resumed&&_bridge.Observation is {ActiveTaskId.Length:>0})_ = InterruptActiveTaskForPlayerMessage(scope,session);
@@ -243,6 +251,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                             if(!_trialFinished){_trialFinished=true;await Pause();Trace("trial_completed",new{gameDay=s.GameDay,targetDays=end,reason="configured_native_days_elapsed",s.TestRunId});}
                             await Task.Delay(200,_lifetime.Token);continue;
                         }
+                        if(HandleNamingMenu(s)){await Task.Delay(200,_lifetime.Token);continue;}
                         if(WaitSatisfied(s)){RecordWaitCompletion(s,"condition_satisfied");ClearWait();_triggerKind="wait_condition_changed";WakeDecision();}
                         else if(_waitConditionTriggered){_waitConditionTriggered=false;_triggerKind="wait_condition_changed";WakeDecision();}
                         else if(_waitDue>0&&Environment.TickCount64>=_waitDue){RecordWaitCompletion(s,"timed_out");ClearWait();_triggerKind="wait_timeout";WakeDecision();}
@@ -316,7 +325,6 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
     private async Task Think(string instruction,string? expectedScope=null,string? expectedSession=null,bool seasonMaintenance=false)
     {
         var epoch=Interlocked.Read(ref _epoch);var scope=_scope;var session=_session;
-        long continuationFailureVersion;lock(_inputGate)continuationFailureVersion=_continuationFailureVersion;
         if(expectedScope!=null&&(expectedScope!=scope||expectedSession!=session))return;
         var nextProject="";
         var preparingPlans=false;
@@ -327,6 +335,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
         try
         {
             var state=_bridge.Observation!;
+            if(state.Menu==PetNaming.Menu)return;
             if(!seasonMaintenance&&PlanningBlocker(state)!=""){
                 preparingPlans=true;
                 await PrepareRequiredPlan(state,cancellation,decisionId,epoch);
@@ -376,6 +385,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                 _retryAfter=0;
                 Log(new{kind="model",elapsedMs=reply.ElapsedMs,usage=reply.Usage});
                 if(epoch!=Interlocked.Read(ref _epoch)||scope!=_scope||session!=_session){Trace("decision_discarded",new{reason="context_changed"},decisionId);return;}
+                if(_bridge.Observation?.Menu==PetNaming.Menu)return;
                 if(!seasonMaintenance&&_waitCompletion!=null)waitCompletionSeen=true;
                 if(!seasonMaintenance&&(reply.Text!=""||reply.Calls.Count>0)){ConfirmAwarenessDelivery(delivery);ConfirmConversation(conversation);_triggerKind="state_changed";}
                 Trace("model_reply",new{requestId,round,text=reply.Text,calls=reply.Calls,elapsedMs=reply.ElapsedMs,usage=reply.Usage},decisionId);
@@ -392,7 +402,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                 foreach(var call in reply.Calls)
                 {
                     cancellation.ThrowIfCancellationRequested();
-                    if(epoch!=Interlocked.Read(ref _epoch))return;
+                    if(epoch!=Interlocked.Read(ref _epoch)||_bridge.Observation?.Menu==PetNaming.Menu)return;
                     var name=call?["function"]?["name"]?.GetValue<string>()??"";
                     var rawArguments=call?["function"]?["arguments"]?.GetValue<string>()??"{}";
                     JsonObject arguments;
@@ -434,7 +444,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                                 if(!allowed.Contains(skill))throw new InvalidOperationException("skill_not_in_current_scope:"+skill+":call_list_capabilities_to_expand");
                                 if(name.StartsWith("group_",StringComparison.Ordinal)&&BusinessCapabilities.GroupFor(skill)!=name[6..])throw new InvalidOperationException("skill_outside_parent_group:"+skill);
                             }
-                            result=StartPlan(arguments,decisionId);mutation=true;
+                            result=StartPlan(arguments,decisionId,context);mutation=true;
                         }
                         else if(name=="wait_for_change")
                         {
@@ -476,6 +486,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                             if(epoch!=Interlocked.Read(ref _epoch))return;
                             var taskId=Guid.NewGuid().ToString("N");
                             BeginAction(taskId,name,authorized,_bridge.Observation??latest);
+                            DiscardContinuation();
                             _taskDecisions[taskId]=decisionId;
                             if(nextProject!="")_taskProjects[taskId]=nextProject;
                             Trace("task_dispatch",new{taskId,skill=name,arguments=authorized,source="model"},decisionId);
@@ -503,11 +514,6 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                         modelResult=new{status=observed.Status,reason=observed.Reason,observationRevision=observed.ObservationRevision,observationUpdated=true,reference="world"};
                     }
                     messages.Add(new JsonObject{["role"]="tool",["tool_call_id"]=call!["id"]!.GetValue<string>(),["content"]=DecisionContextCompression.Serialize(modelResult)});
-                    if(!seasonMaintenance&&mutation&&Mode!="plan_only"&&_resumed
-                        &&(name.StartsWith("group_",StringComparison.Ordinal)||ToolCatalog.Actions.Contains(name)||BusinessCapabilities.Find(name) is {Query:false})
-                        &&(result is TaskResult {Status:"accepted" or "completed"}
-                            ||JsonSerializer.SerializeToNode(result)?["status"]?.ToString() is "accepted" or "completed"))
-                        await PlanContinuation(context,name,new{arguments,result},decisionId,epoch,continuationFailureVersion,cancellation);
                     if(mutation||PendingQuestion!="")break;
                 }
                 if(mutation){_emptyDecisionRetries=0;break;}
@@ -517,8 +523,8 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                 }
             }
         }
-        catch(OperationCanceledException){Trace("decision_cancelled",new{reason=epoch==Interlocked.Read(ref _epoch)?"timeout":"context_changed"},decisionId);if(epoch==Interlocked.Read(ref _epoch)){Status="模型请求超时；当前本地任务继续";_retryAfter=Environment.TickCount64+60000;Changed?.Invoke();}}
-        catch(Exception ex){Status=(preparingPlans?"必需计划未生成完成，禁止执行动作；60秒后重试：":"模型暂不可用，60秒后自动重试：")+SafeError(ex);_retryAfter=Environment.TickCount64+60000;Log(new{kind="model_error",error=ex.GetType().Name});Trace("model_error",new{error=SafeError(ex)},decisionId);Changed?.Invoke();}
+        catch(OperationCanceledException){Trace("decision_cancelled",new{reason=epoch==Interlocked.Read(ref _epoch)?"timeout":"context_changed"},decisionId);if(epoch==Interlocked.Read(ref _epoch)){Status=$"模型请求超时，{ModelRetryDelaySeconds}秒后重试";_retryAfter=Environment.TickCount64+ModelRetryDelaySeconds*1000;Changed?.Invoke();}}
+        catch(Exception ex){Status=(preparingPlans?$"必需计划未生成完成，{ModelRetryDelaySeconds}秒后重试：":$"模型暂不可用，{ModelRetryDelaySeconds}秒后自动重试：")+SafeError(ex);_retryAfter=Environment.TickCount64+ModelRetryDelaySeconds*1000;Log(new{kind="model_error",error=ex.GetType().Name});Trace("model_error",new{error=SafeError(ex)},decisionId);Changed?.Invoke();}
         finally{
             if(waitCompletionSeen&&!seasonMaintenance)_waitCompletion=null;
             if(_planTask is not {IsCompleted:false}&&Environment.TickCount64>=_decisionDue)_decisionDue=Environment.TickCount64+1000;
@@ -528,7 +534,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                 }else {_triggerKind="season_maintenance_completed";WakeDecision(_bridge.Observation?.Revision??0);}
             }
             else if(!seasonMaintenance&&epoch==Interlocked.Read(ref _epoch)&&_resumed&&PendingQuestion==""&&_waitDue==0&&_retryAfter==0
-                &&_bridge.Observation?.ActiveTaskId==""&&_planTask is not {IsCompleted:false}&&Volatile.Read(ref _decisionRequested)==0){
+                &&_bridge.Observation is {ActiveTaskId:"",Menu:not PetNaming.Menu}&&_planTask is not {IsCompleted:false}&&Volatile.Read(ref _decisionRequested)==0){
                 var delaySeconds=Math.Min(60,5*(1<<Math.Min(_emptyDecisionRetries++,4)));
                 _triggerKind="no_action_retry";_retryAfter=Environment.TickCount64+delaySeconds*1000;
                 Status=$"模型未选择下一步工具，{delaySeconds}秒后重新规划";Trace("no_action_retry_scheduled",new{delaySeconds},decisionId);Changed?.Invoke();
@@ -567,10 +573,11 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
             try
             {
                 await Task.WhenAll(new[]{_loop,_thinking,_planTask}.OfType<Task>());
+                if(_continuationTask!=null)await _continuationTask;
             }
             finally
             {
-                _planCancellation?.Dispose();_lifetime.Dispose();_memory.Dispose();
+                _continuationCancellation?.Dispose();_planCancellation?.Dispose();_lifetime.Dispose();_memory.Dispose();
             }
         }
     }

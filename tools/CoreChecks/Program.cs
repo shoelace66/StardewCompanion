@@ -104,7 +104,7 @@ server.MapPost("/scenario",async context=>
         if(!body["tools"]!.AsArray().Any(t=>t?["function"]?["name"]?.GetValue<string>()=="update_project"))
             calls.Add(new JsonObject{["id"]="expand",["type"]="function",["function"]=new JsonObject{["name"]="list_capabilities",["arguments"]="{}"}});
         else {
-        calls.Add(new JsonObject{["id"]="project",["type"]="function",["function"]=new JsonObject{["name"]="update_project",["arguments"]=JsonSerializer.Serialize(new{projectId=scenarioProject,nextStep="走到农场入口"})}});
+            calls.Add(new JsonObject{["id"]="project",["type"]="function",["function"]=new JsonObject{["name"]="update_project",["arguments"]=JsonSerializer.Serialize(new{projectName=scenarioProject,nextStep="走到农场入口"})}});
         calls.Add(new JsonObject{["id"]="travel",["type"]="function",["function"]=new JsonObject{["name"]="go_to",["arguments"]="{\"location\":\"Farm\",\"x\":1,\"y\":2}"}});
         }
     }
@@ -140,7 +140,8 @@ var modelSettings=new ModelSettings{Endpoint=server.Urls.Single()+"/chat/complet
 var bridge=new FakeBridge();var store=new MemoryStore(Path.Combine(folder,"runtime.db"));
 await using(var runtime=new CompanionRuntime(bridge,store,modelSettings,new HttpClient(),Path.Combine(folder,"events.jsonl")))
 {
-    runtime.Start();bridge.Observe(observation);await runtime.Resume();runtime.SendMessage("走到农场 1,2");
+    bridge.Observe(observation);PlanningFixture.Seed(runtime,"走到农场 1,2");
+    await runtime.Resume();runtime.SendMessage("走到农场 1,2");runtime.Start();
     await requested.Task.WaitAsync(TimeSpan.FromSeconds(5));
     var timer=System.Diagnostics.Stopwatch.StartNew();await runtime.Pause();Assert(timer.ElapsedMilliseconds<250,"runtime pause independent of pending model HTTP");
     release.TrySetResult();await Task.Delay(500);
@@ -152,7 +153,8 @@ var projectBridge=new FakeBridge();
 await using(var projectRuntime=new CompanionRuntime(projectBridge,new MemoryStore(Path.Combine(folder,"project-runtime.db")),scenarioSettings,new HttpClient(),Path.Combine(folder,"project-runtime.jsonl")))
 {
     projectBridge.Observe(observation);projectRuntime.AddMemory("project","先走到入口");
-    scenarioProject=projectRuntime.Memory.Projects(projectRuntime.Scope).Single().Id;
+    scenarioProject=projectRuntime.Memory.Projects(projectRuntime.Scope).Single().Goal;
+    PlanningFixture.Seed(projectRuntime,"走到农场入口");
     projectBridge.Observation!.ActiveTaskId="previous-task";
     await projectRuntime.Resume();projectRuntime.SendMessage("关联项目后切换任务");projectRuntime.Start();
     await Until(()=>projectBridge.Commands.Count==1,"model switches from an existing task to a project task");

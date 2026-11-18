@@ -75,6 +75,8 @@ internal sealed class RoutineExecutor
     internal int Completed { get; private set; }
     internal string Reason { get; private set; } = "";
     internal string Phase { get; private set; } = "starting";
+    internal ExecutionTargets.ResolutionFailure? TargetFailure=>_business?.TargetFailure;
+    internal object? NavigationFailure {get;private set;}
     internal RoutineExecutor(string skill, string arguments, Action<GridPoint> interact, string encounterPolicy = "interrupt")
     {
         _skill = skill; using var json = JsonDocument.Parse(arguments); _args = json.RootElement.Clone();
@@ -292,7 +294,7 @@ internal sealed class RoutineExecutor
             if (map == Game1.currentLocation.NameOrUniqueName && Navigation.Current.Distance(goal) <= 2) { Phase = "following_wait"; return "running"; }
             if (map == Game1.currentLocation.NameOrUniqueName) goal = _nav.BestAdjacent(goal) ?? goal;
         }
-        else if(_args.TryGetProperty("name",out _)||!_args.TryGetProperty("x",out _)){
+        else if(_args.TryGetProperty("name",out var named)&&named.ValueKind==JsonValueKind.String||!_args.TryGetProperty("x",out _)){
             if(_namedTarget==null){
                 _namedTarget=NavigationTargets.Resolve(_args,out var failure);
                 if(_namedTarget==null){_navigationResults.Add(failure!);return End(JsonSerializer.SerializeToElement(failure).GetProperty("reason").GetString()!);}
@@ -310,7 +312,12 @@ internal sealed class RoutineExecutor
                 if(_namedTarget.Kind=="chest"&&(!Game1.currentLocation.objects.TryGetValue(new(goal.X,goal.Y),out var chest)
                     ||chest is not Chest||!chest.modData.TryGetValue(WorldView.ChestKey,out var chestId)||chestId!=_namedTarget.Id))
                     return End("named_chest_binding_invalid");
-                var adjacent=_nav.BestAdjacent(goal);if(adjacent==null)return End("named_target_unreachable");goal=adjacent.Value;
+                var adjacent=_nav.BestAdjacent(goal);
+                if(adjacent==null){
+                    NavigationFailure=_nav.FailureEvidence(map,goal,"named_target_unreachable");
+                    return End("named_target_unreachable");
+                }
+                goal=adjacent.Value;
             }
         }
         else { map = Text("location"); goal = new(Number("x"), Number("y")); }
@@ -321,7 +328,11 @@ internal sealed class RoutineExecutor
         }
         Phase = "walking";
         var state = _nav.Move(map, goal, input, _interact, _skill=="go_to"&&Flag("breakNaturalObstacles"));
-        if(state is "blocked" or "unsupported"){CaptureNavigationEffects();return End(_nav.Reason);}
+        if(state is "blocked" or "unsupported"){
+            CaptureNavigationEffects();
+            if(_skill=="go_to")NavigationFailure=_nav.FailureEvidence(map,goal,_nav.Reason);
+            return End(_nav.Reason);
+        }
         if (state != "reached" || _skill == "follow_player") return "running";
         CaptureNavigationEffects();
         if(_namedTarget!=null)_navigationResults.Add(new{state="arrived",target=_namedTarget,playerTile=Navigation.Current,interacted=false});

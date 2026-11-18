@@ -60,7 +60,7 @@ public static class DecisionContextCompression
     {
         var result=Pick(source,"taskId","skill","status","reason","completed","observationRevision");
         if(Decode(Get(source,"details")) is JsonObject detail){
-            foreach(var name in new[]{"requestedTarget","playerStart","playerEnd","location","collectedItems","actualCost","completedUnit","businessDetails"})
+            foreach(var name in new[]{"requestedTarget","playerStart","playerEnd","location","collectedItems","actualCost","completedUnit","businessDetails","targetResolution","navigationFailure"})
                 if(Get(detail,name) is {} value)result[name]=Evidence(value);
             if(result["requestedTarget"] is JsonObject target){target.Remove("_bindings");target.Remove("allowedIds");}
             foreach(var name in new[]{"affectedTiles","remainingDrops"})

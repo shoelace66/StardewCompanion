@@ -14,7 +14,7 @@ public sealed record ModelReply(string Text, JsonObject Message, JsonArray Calls
 }
 public sealed class ModelClient(HttpClient http)
 {
-    public async Task<ModelReply> Complete(ModelSettings settings, JsonArray messages, CancellationToken cancellation, JsonNode? toolChoice = null, bool soloTest=false,CapabilityStatus[]? capabilities=null,JsonArray? toolOverrides=null,Action<JsonObject>? capture=null,int maxTokens=2400)
+    public async Task<ModelReply> Complete(ModelSettings settings, JsonArray messages, CancellationToken cancellation, JsonNode? toolChoice = null, bool soloTest=false,CapabilityStatus[]? capabilities=null,JsonArray? toolOverrides=null,Action<JsonObject>? capture=null,int maxTokens=2400,bool retryTransport=true)
     {
         var availableTools=toolOverrides??ToolCatalog.Definitions(soloTest,capabilities);
         var body=new JsonObject { ["model"]=settings.Model,["messages"]=messages.DeepClone(),["stream"]=false,["max_tokens"]=maxTokens };
@@ -39,13 +39,13 @@ public sealed class ModelClient(HttpClient http)
         if(!response.IsSuccessStatusCode)throw new HttpRequestException($"模型请求失败（HTTP {(int)response.StatusCode}）",null,response.StatusCode);
         return ParseReply(await response.Content.ReadAsStringAsync(requestCancellation),timer);
         }
-        catch(IOException)when(!requestCancellation.IsCancellationRequested&&OperatingSystem.IsWindows()){
+        catch(IOException)when(retryTransport&&!requestCancellation.IsCancellationRequested&&OperatingSystem.IsWindows()){
             return await CompleteViaWindowsPowerShell(settings,payload,timer,requestCancellation);
         }
-        catch(HttpRequestException ex)when(!requestCancellation.IsCancellationRequested&&OperatingSystem.IsWindows()&&ex.StatusCode==null){
+        catch(HttpRequestException ex)when(retryTransport&&!requestCancellation.IsCancellationRequested&&OperatingSystem.IsWindows()&&ex.StatusCode==null){
             return await CompleteViaWindowsPowerShell(settings,payload,timer,requestCancellation);
         }
-        catch(HttpRequestException ex)when(attempt<2&&!requestCancellation.IsCancellationRequested&&(ex.StatusCode==null||(int)ex.StatusCode==429||(int)ex.StatusCode>=500)){
+        catch(HttpRequestException ex)when(retryTransport&&attempt<2&&!requestCancellation.IsCancellationRequested&&(ex.StatusCode==null||(int)ex.StatusCode==429||(int)ex.StatusCode>=500)){
             await Task.Delay(TimeSpan.FromSeconds(attempt+1),requestCancellation);
         }
         }

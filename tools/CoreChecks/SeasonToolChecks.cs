@@ -15,15 +15,13 @@ internal static class SeasonToolChecks
             var settings=new ModelSettings{Endpoint="http://127.0.0.1:1/chat/completions",Model="season-check"};settings.SetKey("not-real");
             await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(scenarioFolder,"memory.db")),settings,new HttpClient(model),Path.Combine(scenarioFolder,"events.jsonl"));
             bridge.Publish();await runtime.UpdateGoal(new PlayerGoalUpdate{Objective="季节维护测试目标",ReplaceObjective=true});await runtime.Resume();bridge.Observation!.GameDay++;bridge.Publish();runtime.Start();
-            var deadline=Environment.TickCount64+5000;
-            while(!runtime.Decisions.Read().Any(e=>e.Kind=="decision_finished")&&Environment.TickCount64<deadline)await Task.Delay(10);
+            var deadline=Environment.TickCount64+15000;
+            while(!runtime.Decisions.Read().Any(e=>e.Kind=="season_plan_created")&&Environment.TickCount64<deadline)await Task.Delay(10);
             await runtime.Pause();
-            if(model.Requests.Count<2)throw new Exception("Season tool did not receive correction feedback: "+scenario);
-            var correction=model.Requests[1]["messages"]!.AsArray().Last(m=>m?["role"]?.ToString()=="tool")!;
-            if(JsonNode.Parse(correction["content"]!.GetValue<string>())?["status"]?.ToString()!="rejected")
-                throw new Exception("Invalid season arguments were accepted: "+scenario);
-            if(!runtime.Decisions.Read().Any(e=>e.Kind=="tool_rejected")||runtime.Decisions.Read().Any(e=>e.Kind=="model_error"))
-                throw new Exception("Season rejection must stay inside the tool correction loop: "+scenario);
+            var events=runtime.Decisions.Read();
+            var saved=events.FirstOrDefault(e=>e.Kind=="season_plan_created");
+            if(model.Requests.Count<2||saved==null||!events.Any(e=>e.Kind=="model_error"&&e.Sequence<saved.Sequence))
+                throw new Exception("The required season plan must reject the invalid request and retry: "+scenario);
             if(runtime.Decisions.Read().Count(e=>e.Kind=="season_plan_created")!=1||runtime.Memory.Get(runtime.Scope,"season_plan")==null)
                 throw new Exception("Only the corrected season plan may be persisted: "+scenario);
             if(bridge.Dispatches!=0)throw new Exception("Season maintenance dispatched a game action");
@@ -38,10 +36,13 @@ internal static class SeasonToolChecks
         {
             var body=JsonNode.Parse(await request.Content!.ReadAsStringAsync(cancellation))!;Requests.Add(body);
             var tools=body["tools"]!.AsArray();
-            if(!tools.Any(t=>t?["function"]?["name"]?.ToString()=="create_season_plan"))
-                throw new Exception("Expected the season maintenance tool scope");
-            var arguments=new JsonObject{["season"]="spring",["goal"]="照料已观察的作物",["constraints"]=new JsonArray(),
-                ["successCriteria"]=new JsonArray("实际浇水回执"),["progress"]=new JsonArray(),["previousSeasonReview"]="首次创建"};
+            if(!tools.Any(t=>t?["function"]?["name"]?.ToString()=="create_season_plan")){
+                var idle=new{choices=new[]{new{message=new{role="assistant",content=""}}}};
+                return new(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(idle))};
+            }
+            var arguments=new JsonObject{["season"]="spring",["goal"]="照料已观察的作物",["constraints"]=new JsonArray("保留现有作物"),
+                ["successCriteria"]=new JsonArray("实际浇水回执"),["milestones"]=new JsonArray("每日确认土壤状态"),
+                ["resourceStrategy"]=new JsonArray("保留浇水所需体力"),["progress"]=new JsonArray(),["previousSeasonReview"]="首次创建"};
             if(Requests.Count==1){
                 if(scenario=="missing_progress")arguments.Remove("progress");
                 if(scenario=="unknown_field")arguments["year"]=99;

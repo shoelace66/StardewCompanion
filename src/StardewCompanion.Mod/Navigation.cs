@@ -17,6 +17,7 @@ internal sealed class Navigation
     private Vector2 _lastPosition;
     private long _lastMove;
     private int _replans;
+    private int _entranceReplans;
     private long _transitionStarted;
     private string _observedMap = "";
     private string _previousTransitionFrom = "";
@@ -25,6 +26,7 @@ internal sealed class Navigation
     private HashSet<GridPoint> _arrivalExitTiles=new();
     private int _mapBounces;
     private readonly HashSet<MapEdge> _deadEndEntrances = new();
+    private readonly HashSet<MapEdge> _blockedEntrances = new();
     private MapEdge? _incomingEdge;
     private string _routeFrom="";
     private string _routeTo="";
@@ -79,10 +81,11 @@ internal sealed class Navigation
         var warp=target.warps.FirstOrDefault(w=>!w.npcOnly.Value && w.TargetName==from);
         return warp==null?null:new GridPoint(warp.X,warp.Y);
     }
-    internal static IReadOnlyList<MapEdge>? Route(string from, string to, HashSet<MapEdge>? excluded = null)
+    internal static IReadOnlyList<MapEdge>? Route(string from, string to, HashSet<MapEdge>? excluded = null,HashSet<MapEdge>? blocked = null)
     {
         var currentMap=Game1.currentLocation?.NameOrUniqueName??"";var current=Current;
-        var edges=Edges().Where(edge => excluded?.Any(previous => previous.From == edge.From && previous.To == edge.To && Nullable.Equals(previous.ArrivalTile, edge.ArrivalTile)) != true).ToList();
+        var edges=Edges().Where(edge=>blocked?.Contains(edge)!=true&&
+            excluded?.Any(previous => previous.From == edge.From && previous.To == edge.To && Nullable.Equals(previous.ArrivalTile, edge.ArrivalTile)) != true).ToList();
         while(true){
             var route=Pathfinding.Dijkstra(from,to,edges,e=>e.From,e=>e.To,
                 e=>100+(e.From==currentMap?e.Tile.Distance(current):0));
@@ -120,7 +123,7 @@ internal sealed class Navigation
         return !l.isCollidingPosition(new Rectangle(p.X * 64 + 8, p.Y * 64 + 16, 48, 32), Game1.viewport,
             true, 0, false, Game1.player, true, skipCollisionEffects: true);
     }
-    internal void Reset() { _path = null; _map = ""; _replans = 0; _transitionStarted = 0; _observedMap="";_previousTransitionFrom="";_previousTransitionTo="";_arrivalClearance=null;_mapBounces=0;_deadEndEntrances.Clear();_incomingEdge=null;_routeFrom="";_routeTo="";_routeCache=null;_routeApproachCache=null;_routeCacheInitialized=false;_breakingTarget=null;_breakingApproach=null;_breakWaitUntil=0;_breakingType=null;_breakingItemId=null;_breakingTool=null;Reason = ""; }
+    internal void Reset() { _path = null; _map = ""; _replans = 0; _entranceReplans=0;_transitionStarted = 0; _observedMap="";_previousTransitionFrom="";_previousTransitionTo="";_arrivalClearance=null;_mapBounces=0;_deadEndEntrances.Clear();_blockedEntrances.Clear();_incomingEdge=null;_routeFrom="";_routeTo="";_routeCache=null;_routeApproachCache=null;_routeCacheInitialized=false;_breakingTarget=null;_breakingApproach=null;_breakWaitUntil=0;_breakingType=null;_breakingItemId=null;_breakingTool=null;Reason = ""; }
     internal void Suspend() { _lastMove = Environment.TickCount64; _lastPosition = Game1.player.Position;if(_transitionStarted!=0)_transitionStarted=_lastMove; }
     // Returns reached / moving / blocked / unsupported. Only emits normal held direction input.
     internal string Move(string location, GridPoint goal, AiInputSimulator input, Action<GridPoint> interact, bool breakNaturalObstacles=false)
@@ -164,18 +167,19 @@ internal sealed class Navigation
         if (here.NameOrUniqueName != location)
         {
             if(!_routeCacheInitialized||_routeFrom!=here.NameOrUniqueName||_routeTo!=location){
+                if(_routeFrom!=here.NameOrUniqueName||_routeTo!=location)_entranceReplans=0;
+                if(_routeTo!=location)_blockedEntrances.Clear();
                 _routeFrom=here.NameOrUniqueName;_routeTo=location;
-                _routeCache = Route(_routeFrom, _routeTo, _deadEndEntrances);
-                if (_routeCache == null && _deadEndEntrances.Count > 0)
-                    _routeCache = Route(_routeFrom, _routeTo); // The only entrance may have bounced transiently.
-                var first=_routeCache?.FirstOrDefault();
+                var selected=Route(_routeFrom,_routeTo,_deadEndEntrances,_blockedEntrances);
+                if(selected==null&&_deadEndEntrances.Count>0)
+                    selected=Route(_routeFrom,_routeTo,blocked:_blockedEntrances);
+                var first=selected?.FirstOrDefault();
                 // A map can contain disconnected walkable regions (e.g. Backwoods).
                 // If the only reachable route takes us straight back, avoid this
                 // entrance when planning the next leg from the previous map.
                 if (first != null && _incomingEdge is {} entrance && first.To == entrance.From)
                     _deadEndEntrances.Add(entrance);
-                _routeApproachCache=first==null?null:first.Interact?BestAdjacent(first.Tile):new GridPoint(
-                    Math.Clamp(first.Tile.X,0,here.Map.Layers[0].LayerWidth-1),Math.Clamp(first.Tile.Y,0,here.Map.Layers[0].LayerHeight-1));
+                SetRoute(selected,here);
                 _routeCacheInitialized=true;
             }
             var route = _routeCache;
@@ -196,11 +200,12 @@ internal sealed class Navigation
                 input.Clear();return "blocked";
             }
             var approach = _routeApproachCache;
-            if (approach == null) { Reason = "exit_unreachable"; return "blocked"; }
-            var state = Local(approach.Value, input, false);
+            if (approach == null) { Reason = "exit_unreachable"; return RecoverEntrance(edge,here,input); }
+            var state = Local(approach.Value,input,false,entrance:true);
+            if(state=="blocked")return RecoverEntrance(edge,here,input);
             if (state != "reached") return state;
             if (_transitionStarted == 0) _transitionStarted = Environment.TickCount64;
-            if (Environment.TickCount64 - _transitionStarted > 5000) { Reason = "exit_did_not_transition"; return "blocked"; }
+            if (Environment.TickCount64 - _transitionStarted > 5000) { Reason = "exit_did_not_transition"; return RecoverEntrance(edge,here,input); }
             if (edge.Interact) interact(edge.Tile);
             else
             {
@@ -212,8 +217,62 @@ internal sealed class Navigation
         }
         _transitionStarted = 0;
         var reachedGoal = Local(goal, input, breakNaturalObstacles);
-        if (reachedGoal == "reached") { _mapBounces = 0; _deadEndEntrances.Clear(); _incomingEdge = null; }
+        if (reachedGoal == "reached") { _mapBounces = 0; _deadEndEntrances.Clear(); _blockedEntrances.Clear(); _incomingEdge = null; }
         return reachedGoal;
+    }
+
+    private void SetRoute(IReadOnlyList<MapEdge>? route,GameLocation here)
+    {
+        _routeCache=route;
+        var first=route?.FirstOrDefault();
+        _routeApproachCache=first==null?null:first.Interact?BestAdjacent(first.Tile):new GridPoint(
+            Math.Clamp(first.Tile.X,0,here.Map.Layers[0].LayerWidth-1),Math.Clamp(first.Tile.Y,0,here.Map.Layers[0].LayerHeight-1));
+    }
+
+    private string RecoverEntrance(MapEdge blocked,GameLocation here,AiInputSimulator input)
+    {
+        input.Clear();
+        if(_entranceReplans>=3){
+            if(Reason=="entrance_approach_stalled")Reason="blocked_after_3_replans";
+            return "blocked";
+        }
+        _entranceReplans++;
+        _blockedEntrances.Add(blocked);
+        var alternative=Route(_routeFrom,_routeTo,_deadEndEntrances,_blockedEntrances);
+        if(alternative!=null)SetRoute(alternative,here);
+        else{
+            _blockedEntrances.Remove(blocked);
+            if(Reason!="entrance_approach_stalled")return "blocked";
+        }
+        _path=null;_lastMove=Environment.TickCount64;_lastPosition=Game1.player.Position;_transitionStarted=0;
+        return "moving";
+    }
+
+    internal object FailureEvidence(string destination,GridPoint? target,string reason)
+    {
+        var here=Game1.currentLocation.NameOrUniqueName;
+        var entrance=here==destination?null:_routeCache?.FirstOrDefault();
+        var candidates=here==destination&&target is {} tile?ReachableNear(tile):Array.Empty<GridPoint>();
+        var releaseCondition=reason.StartsWith("destination_closed_until:",StringComparison.Ordinal)?"wait_until_observed_opening_time":
+            reason.StartsWith("destination_closed_for_today:",StringComparison.Ordinal)?"new_day_and_recheck_hours":
+            candidates.Length>0?"choose_a_returned_reachable_tile":"recheck_current_map_and_route_before_retry";
+        return new{reason,blockedMap=here,playerTile=Current,destination,target,entrance,
+            entranceReplans=_entranceReplans,reachableTiles=candidates,releaseCondition};
+    }
+
+    private GridPoint[] ReachableNear(GridPoint goal)
+    {
+        var here=Game1.currentLocation;
+        if(!WorldView.Supported(here))return Array.Empty<GridPoint>();
+        var exits=Edges().Where(edge=>edge.From==here.NameOrUniqueName).Select(edge=>edge.Tile).ToHashSet();
+        return (from x in Enumerable.Range(goal.X-4,9)
+                from y in Enumerable.Range(goal.Y-4,9)
+                let tile=new GridPoint(x,y)
+                let distance=tile.Distance(goal)
+                where distance is >0 and <=4&&!exits.Contains(tile)&&Passable(tile)
+                orderby distance,tile.Distance(Current),x,y
+                select tile).Where(tile=>Pathfinding.AStar(Current,tile,p=>exits.Contains(p)?null:Cost(p,false))!=null)
+            .Take(3).ToArray();
     }
     private GridPoint? ArrivalClearance(string previousMap)
     {
@@ -300,7 +359,7 @@ internal sealed class Navigation
         }
         return "reached";
     }
-    private string Local(GridPoint goal, AiInputSimulator input,bool breakNaturalObstacles)
+    private string Local(GridPoint goal, AiInputSimulator input,bool breakNaturalObstacles,bool entrance=false)
     {
         var now = Environment.TickCount64; var current = Game1.player.Position;
         if (_map != Game1.currentLocation.NameOrUniqueName || !_goal.Equals(goal))
@@ -311,6 +370,7 @@ internal sealed class Navigation
         if (Vector2.DistanceSquared(current, _lastPosition) > 64) { _lastMove = now; _lastPosition = current; }
         if (now - _lastMove > 2000)
         {
+            if(entrance){Reason="entrance_approach_stalled";return "blocked";}
             if (++_replans > 3) { Reason = "blocked_after_3_replans"; return "blocked"; }
             _path = null; _lastMove = now;
         }

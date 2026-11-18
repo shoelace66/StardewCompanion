@@ -153,6 +153,7 @@ public sealed class GameBridge : IGameBridge, IAsyncDisposable
     }
     public async Task<TaskResult> Dispatch(string skill, object arguments, bool waitForTerminal=false,CancellationToken cancellation=default,string? taskId=null,string encounterPolicy="interrupt")
     {
+        cancellation.ThrowIfCancellationRequested();
         var state=Observation;
         if (!Fresh || state?.WorldReady!=true) throw new InvalidOperationException("游戏正在加载或观察已过期，暂不执行动作");
         var command=Command(state,skill,arguments,taskId,encounterPolicy);

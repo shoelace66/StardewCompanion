@@ -155,6 +155,7 @@ internal static class DecisionQualityChecks
         await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(folder,scenario+".db")),settings,new HttpClient(handler),Path.Combine(folder,scenario,"events.jsonl"));
         bridge.Publish();
         await runtime.UpdateGoal(new(){Objective="持续照料春季作物，并存钱升级农舍",Restrictions=new[]{"不出售稀有物"}});
+        PlanningFixture.Seed(runtime);
         runtime.AddMemory("project","升级农舍");runtime.AddMemory("agreement","不出售稀有物");runtime.AddMemory("routine","按实际观察照料作物");
         await runtime.Resume();runtime.Start();
         var until=Environment.TickCount64+10000;

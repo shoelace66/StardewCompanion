@@ -182,6 +182,7 @@ public sealed partial class CompanionRuntime
     private HashSet<string> DisabledSkills()=>new((PlayerGoal["disabledSkills"] as JsonArray??new()).Select(v=>v!.ToString()).Append("mine_travel"),StringComparer.Ordinal);
     private void ValidateSkillScope(string skill,JsonObject? args=null)
     {
+        if(_bridge.Observation?.Menu==PetNaming.Menu)throw new InvalidOperationException("player_input_required:NamingMenu");
         if(_bridge.Observation?.Menu=="DialogueBox"&&skill!="respond_dialogue")throw new InvalidOperationException("blocking_dialogue_requires_response");
         if(MiningSkill(skill)||DisabledSkills().Contains(skill))throw new InvalidOperationException("skill_disabled:"+skill);
         foreach(var field in new[]{"location","destination","toLocation"}){
@@ -293,12 +294,12 @@ public sealed partial class CompanionRuntime
                 "player_message"=>"玩家发来新消息", "goal_updated"=>"玩家更新了长期目标", "new_day"=>"进入新的游戏日", "task_terminal"=>"本地操作已返回结果",
                 "no_action_retry"=>"上一轮只叙述计划但未选择可执行工具；请选择一个下一步工具，或明确调用wait_for_change等待条件",
                 "important_event"=>"收到游戏事件或操作结果", "wait_condition_changed"=>"等待条件已变化", "session_started"=>"连接当前游戏会话", _=>"继续推进当前工作"};
-            var season=GetSeasonPlan();
-            if(season is JsonObject seasonObject)work["seasonPlan"]=seasonObject;
+            work.Remove("seasonPlan");
             var input=new JsonObject{
+                ["playerGoal"]=goal,["planning"]=PlanningPreview,
                 ["trigger"]=new JsonObject{["kind"]=kind,["gameDay"]=state.GameDay,["reason"]=triggerReason},
-                ["playerGoal"]=goal,["conversation"]=conversation.DeepClone(),["agentState"]=work,
-                ["planning"]=PlanningPreview,["continuation"]=_continuation?.DeepClone(),
+                ["conversation"]=conversation.DeepClone(),["agentState"]=work,
+                ["continuation"]=_continuation?.DeepClone(),
                 ["waitCompletion"]=_waitCompletion?.DeepClone(),
                 ["world"]=ProjectWorld(state,tools),["recentEvents"]=events,
                 ["activeProjects"]=ProjectActiveProjects(),

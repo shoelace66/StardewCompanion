@@ -7,7 +7,9 @@ namespace StardewCompanion.Core;
 public sealed partial class CompanionRuntime
 {
     private JsonObject? _continuation;
-    private long _continuationFailureVersion;
+    private CancellationTokenSource? _continuationCancellation;
+    private Task? _continuationTask;
+    private static readonly TimeSpan ContinuationDelay=TimeSpan.FromSeconds(3);
     private const int ContinuationMaxTokens=1500;
 
     private async Task<object> RequestTaskCancellation(CancellationToken cancellation,string? expectedTaskId=null)
@@ -16,7 +18,7 @@ public sealed partial class CompanionRuntime
         if(taskId=="")return new{status="no_active_task",cancelled=false};
         if(_bridge.Observation?.ActiveTaskId!=taskId)return new{status="target_task_changed_not_cancelled",targetTaskId=taskId,cancelled=false};
         cancellation.ThrowIfCancellationRequested();
-        _planCancellation?.Cancel();DiscardContinuation(failed:true);
+        _planCancellation?.Cancel();DiscardContinuation();
         await _bridge.CancelTask(taskId);
         var until=Environment.TickCount64+3000;
         do{
@@ -31,37 +33,63 @@ public sealed partial class CompanionRuntime
         return new{status="cancel_requested",targetTaskId=taskId,cancelled=(bool?)null,terminalVerificationRequired=true};
     }
 
-    private void DiscardContinuation(bool failed=false)
+    private void DiscardContinuation()
     {
-        lock(_inputGate){_continuation=null;if(failed)_continuationFailureVersion++;}
+        lock(_inputGate){
+            _continuation=null;
+            _continuationCancellation?.Cancel();
+        }
     }
 
-    // This request overlaps execution: record a hypothesis or cancel the exact observed task.
-    private async Task PlanContinuation(JsonObject context,string predecessor,object acceptance,
-        string decision,long epoch,long failureVersion,CancellationToken cancellation)
+    private static JsonObject BuildContinuationInput(JsonObject context,ShortPlan plan)
     {
-        DiscardContinuation();
-        // Decouple the auxiliary continuation deadline from the parent decision
-        // cancellation so it gets its full window instead of being cut short by the
-        // main decision deadline. The result is discarded on epoch change, so a
-        // late reply can never be acted upon after the context moved on.
-        using var timeout=CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-        timeout.CancelAfter(TimeSpan.FromSeconds(45));
+        var world=new JsonObject();
+        foreach(var key in new[]{"gameDay","time","location","stamina","health","money","calendar","inventoryState","farmingPlan","risks"})
+            if(context["world"]?[key] is {} value)world[key]=value.DeepClone();
+        return new JsonObject{
+            ["playerGoal"]=context["playerGoal"]?.DeepClone(),
+            ["planning"]=new JsonObject{["seasonPlan"]=OrderSeasonPlan(context["planning"]?["seasonPlan"],includeProgress:false)},
+            ["world"]=world,
+            ["continuationRequest"]=new JsonObject{["planId"]=plan.Id,
+                ["steps"]=JsonSerializer.SerializeToNode(plan.Steps),
+                ["assumption"]="整个短计划成功；执行结果仍需核验",
+                ["observationMeaning"]="world 是执行前快照"}
+        };
+    }
+
+    private CancellationTokenSource? StartContinuation(JsonObject input,string planId,string decision,long epoch,int day,CancellationToken cancellation)
+    {
+        lock(_inputGate){
+            if(epoch!=Interlocked.Read(ref _epoch)||cancellation.IsCancellationRequested)return null;
+            if(_continuationTask is {IsCompleted:false}){
+                Trace("continuation_skipped",new{planId,reason="previous_request_draining"},decision);
+                return null;
+            }
+            _continuationCancellation?.Dispose();
+            _continuationCancellation=CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+            _continuationTask=PlanContinuation(input,planId,decision,epoch,day,_continuationCancellation.Token);
+            return _continuationCancellation;
+        }
+    }
+
+    private void StopContinuation(CancellationTokenSource? request)
+    {
+        lock(_inputGate)
+            if(request!=null&&ReferenceEquals(_continuationCancellation,request))request.Cancel();
+    }
+
+    private async Task PlanContinuation(JsonObject input,string planId,string decision,long epoch,int day,CancellationToken cancellation)
+    {
+        var requested=false;
         try
         {
-            // Continuations need the goal, current plan and pre-action world,
-            // not the full chat transcript and event history from the parent
-            // decision. Keep the request bounded so this auxiliary planning
-            // call has a chance to finish inside the main decision deadline.
-            var input=new JsonObject();
-            foreach(var key in new[]{"trigger","playerGoal","agentState","planning","world","activeProjects","decisionScope"})
-                if(context[key]!=null)input[key]=context[key]!.DeepClone();
-            if(context["recentEvents"] is JsonArray recentEvents)
-                input["recentEvents"]=new JsonArray(recentEvents.TakeLast(6).Select(e=>e?.DeepClone()).ToArray());
-            input["continuationRequest"]=new JsonObject{
-                ["predecessorTool"]=predecessor,["acceptance"]=System.Text.Json.JsonSerializer.SerializeToNode(acceptance),
-                ["assumption"]="上一条命令或整个短计划成功完成；尚未获得成功证据",
-                ["observationMeaning"]="world是执行前快照，不是预测的执行后状态"};
+            await Task.Delay(ContinuationDelay,cancellation);
+            if(!_resumed||epoch!=Interlocked.Read(ref _epoch)||!_bridge.Fresh||
+               _bridge.Observation is not {Menu:""} observed||observed.GameDay!=day){
+                Trace("continuation_skipped",new{planId,reason="batch_context_not_ready"},decision);
+                return;
+            }
+            cancellation.ThrowIfCancellationRequested();
             var messages=new JsonArray{
                 new JsonObject{["role"]="system",["content"]=DecisionInstructions.ContinuousPlanning},
                 new JsonObject{["role"]="user",["content"]=DecisionContextCompression.Serialize(input)}};
@@ -72,15 +100,18 @@ public sealed partial class CompanionRuntime
                         ["nextSteps"]=Strings(),["assumptions"]=Strings(),["checksBeforeAction"]=Strings(),["onFailure"]=new JsonObject{["type"]="string",["minLength"]=1}},
                     ["required"]=new JsonArray("nextSteps","assumptions","checksBeforeAction","onFailure")}}});
             tools.Add(ToolCatalog.PrimitiveDefinitions().First(t=>t?["function"]?["name"]?.ToString()=="cancel_task")!.DeepClone());
-            var controlTaskId=_bridge.Observation?.ActiveTaskId??"";
-            input["activeTask"]=System.Text.Json.JsonSerializer.SerializeToNode(_bridge.Observation is {} observed?new{taskId=observed.ActiveTaskId,observed.Location,observed.Tile,observed.Menu}:null);
+            var controlTaskId=observed.ActiveTaskId;
+            input["activeTask"]=JsonSerializer.SerializeToNode(new{taskId=controlTaskId,observed.Location,observed.Tile,observed.Menu});
             messages[1]!["content"]=DecisionContextCompression.Serialize(input);
-            Trace("continuation_requested",new{predecessor,assumedSuccess=true},decision);
-            Trace("model_request",new{kind="continuation",model=Settings.Model,maxTokens=ContinuationMaxTokens},decision);
-            var reply=await _model.Complete(Settings,messages,timeout.Token,toolOverrides:tools,maxTokens:ContinuationMaxTokens,
+            var requestId=Guid.NewGuid().ToString("N");
+            requested=true;
+            Trace("continuation_requested",new{planId,requestId,assumedSuccess=true},decision);
+            Trace("model_request",new{requestId,kind="continuation",model=Settings.Model,maxTokens=ContinuationMaxTokens},decision);
+            var reply=await _model.Complete(Settings,messages,cancellation,toolOverrides:tools,maxTokens:ContinuationMaxTokens,
                 toolChoice:JsonValue.Create("auto"),
-                capture:body=>Trace("model_prompt_capture",new{kind="continuation",prompt=body},decision));
-            Trace("model_reply",new{kind="continuation",text=reply.Text,calls=reply.Calls,elapsedMs=reply.ElapsedMs,usage=reply.Usage,finishReason=reply.FinishReason},decision);
+                capture:body=>Trace("model_prompt_capture",new{requestId,kind="continuation",prompt=body},decision));
+            Trace("model_reply",new{requestId,kind="continuation",text=reply.Text,calls=reply.Calls,elapsedMs=reply.ElapsedMs,usage=reply.Usage,finishReason=reply.FinishReason},decision);
+            cancellation.ThrowIfCancellationRequested();
             if(epoch!=Interlocked.Read(ref _epoch)||!_resumed)return;
             if(reply.FinishReason=="length"){
                 Trace("continuation_unavailable",new{reason="output_truncated",maxTokens=ContinuationMaxTokens,usage=reply.Usage},decision);
@@ -102,7 +133,8 @@ public sealed partial class CompanionRuntime
             if(name=="cancel_task"){
                 ToolCatalog.ValidateArguments("cancel_task",proposal);
                 Trace("tool_selected",new{name,arguments=proposal},decision);
-                var result=await RequestTaskCancellation(timeout.Token,controlTaskId);
+                if(controlTaskId=="")return;
+                var result=await RequestTaskCancellation(cancellation,controlTaskId);
                 Trace("tool_result",new{name="cancel_task",result},decision);return;
             }
             using(var schema=System.Text.Json.JsonDocument.Parse(tools[0]!["function"]!["parameters"]!.ToJsonString()))
@@ -112,14 +144,17 @@ public sealed partial class CompanionRuntime
                 ||!NonemptyStrings(proposal["checksBeforeAction"])||string.IsNullOrWhiteSpace(proposal["onFailure"]?.ToString()))
                 throw new InvalidOperationException("empty_continuation");
             lock(_inputGate){
-                if(epoch!=Interlocked.Read(ref _epoch)||failureVersion!=_continuationFailureVersion||!_resumed)return;
+                if(epoch!=Interlocked.Read(ref _epoch)||cancellation.IsCancellationRequested||!_resumed)return;
                 _continuation=new JsonObject{["status"]="hypothesis_requires_verification",["sourceDecision"]=decision,
-                    ["predecessorTool"]=predecessor,["proposal"]=proposal,
+                    ["planId"]=planId,["proposal"]=proposal,
                     ["executionRule"]="先核对实际回执和当前观察；失败、部分完成或条件改变时放弃不成立的后续意图，重新决策。不得直接当作命令或完成证据。"};
+                Trace("continuation_planned",proposal,decision);
             }
-            Trace("continuation_planned",proposal,decision);
         }
-        catch(OperationCanceledException){Trace("continuation_unavailable",new{reason="cancelled_or_timeout"},decision);}
+        catch(OperationCanceledException){
+            Trace(requested?"continuation_unavailable":"continuation_skipped",
+                new{reason=requested?"batch_ended_or_cancelled":"batch_ended_before_delay",planId},decision);
+        }
         catch(Exception ex)when(ex is not OperationCanceledException){Trace("continuation_unavailable",new{reason=SafeError(ex)},decision);}
 
         static JsonObject Strings()=>new(){["type"]="array",["minItems"]=1,["maxItems"]=8,

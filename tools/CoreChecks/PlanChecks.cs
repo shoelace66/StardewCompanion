@@ -11,7 +11,7 @@ internal static class PlanChecks
     {
         Directory.CreateDirectory(folder);
         foreach(var scenario in new[]{"eight","direct","failure","pause"}){
-            var bridge=new PlanBridge(scenario);
+            var bridge=new PlanBridge(scenario,holdPlan:scenario!="direct");
             bridge.Observation!.WorldView="""{"decisionFacts":{"calendar":{"season":"spring"}}}""";
             var args=new JsonObject{["planId"]="continuation-test",["steps"]=new JsonArray(Enumerable.Range(0,8).Select(i=>(JsonNode)new JsonObject{
                 ["skill"]="go_to",["arguments"]=new JsonObject{["location"]="Farm",["x"]=i+1,["y"]=15}}).ToArray())};
@@ -19,22 +19,30 @@ internal static class PlanChecks
             var settings=new ModelSettings{Endpoint="http://127.0.0.1:1/chat/completions",Model="local-test"};settings.SetKey("not-real");
             await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(folder,scenario+".db")),settings,new HttpClient(handler),Path.Combine(folder,scenario+".jsonl"));
             bridge.Publish();
-            runtime.Memory.Set(runtime.Scope,"player_goal","""{"status":"active","objective":"reach the targets then harvest","version":1}""");
-            runtime.Memory.Set(runtime.Scope,"season_plan","""{"year":1,"season":"spring","goalVersion":1,"goal":"farm","constraints":["no mining"],"successCriteria":["targets reached"],"milestones":["walk"],"resourceStrategy":["reserve stamina"]}""");
+            PlanningFixture.Seed(runtime,"reach the targets then harvest");
             runtime.SendMessage("reach the targets then harvest");await runtime.Resume();runtime.Start();
             if(runtime.PlanningPreview["ready"]?.GetValue<bool>()!=true
                 ||runtime.PlanningPreview.ContainsKey("dayPlan")||runtime.PlanningPreview.ContainsKey("dayCurrent")
                 ||ToolCatalog.RequiredPlanningDefinitions().Count!=1)
                 throw new Exception("FAIL: a valid season plan must allow execution without a daily plan");
-            var until=Environment.TickCount64+5000;
-            while(handler.Continuations==0&&Environment.TickCount64<until)await Task.Delay(10);
-            if(handler.Continuations!=1||!handler.ContinuationWhileRunning)throw new Exception("FAIL: preplanning must overlap game execution");
-            if(scenario=="pause")await runtime.Pause();
-            while(!runtime.Decisions.Read().Any(e=>e.Kind=="plan_finished")&&Environment.TickCount64<until)await Task.Delay(10);
-            if(scenario is "eight" or "direct"){
-                while(!handler.SawContinuation&&Environment.TickCount64<until)await Task.Delay(10);
-                if(!handler.SawContinuation||bridge.Commands.Count!=(scenario=="direct"?1:8))throw new Exception("FAIL: verified next decision must receive continuation without executing speculative actions");
+            var until=Environment.TickCount64+8500;
+            if(scenario=="direct"){
+                while(handler.Requests<2&&Environment.TickCount64<until)await Task.Delay(10);
+                if(handler.Requests<2||handler.Continuations!=0||bridge.Commands.Count!=1)
+                    throw new Exception("FAIL: a direct action reaches its next decision without preplanning");
             }else{
+                while(handler.Continuations==0&&Environment.TickCount64<until)await Task.Delay(10);
+                if(handler.Continuations!=1||!handler.ContinuationWhileRunning)throw new Exception("FAIL: preplanning must overlap a long-running batch");
+                if(scenario=="pause")await runtime.Pause();
+                if(scenario=="eight")
+                    while(!runtime.Decisions.Read().Any(e=>e.Kind=="continuation_planned")&&Environment.TickCount64<until)await Task.Delay(10);
+                bridge.ReleaseFirstStep();
+                while(!runtime.Decisions.Read().Any(e=>e.Kind=="plan_finished")&&Environment.TickCount64<until)await Task.Delay(10);
+            }
+            if(scenario=="eight"){
+                while(!handler.SawContinuation&&Environment.TickCount64<until)await Task.Delay(10);
+                if(!handler.SawContinuation||bridge.Commands.Count!=8)throw new Exception("FAIL: verified next decision must receive continuation without executing speculative actions");
+            }else if(scenario is "failure" or "pause"){
                 await Task.Delay(300);
                 if(runtime.Decisions.Read().Any(e=>e.Kind=="continuation_planned")||bridge.Commands.Count!=(scenario=="pause"?1:2))throw new Exception("FAIL: failed or paused predecessors must discard speculative responses");
             }
@@ -55,7 +63,7 @@ internal static class PlanChecks
         var fishingPlan=new JsonObject{["planId"]="fish-plan",["encounterPolicy"]="avoid",["steps"]=new JsonArray(new JsonObject{["skill"]="fish_at",["arguments"]=new JsonObject{["location"]="Beach",["x"]=10,["y"]=10,["direction"]="right",["casts"]=3,["treasurePolicy"]="ignore"}})};
         Check(ShortPlan.Parse(fishingPlan).EncounterPolicy=="avoid"&&ShortPlan.Parse(fishingPlan).Steps[0].Skill=="fish_at","fish_at and explicit encounter policy pass the production short-plan parser");
         fishingPlan["encounterPolicy"]="invented";Reject(fishingPlan);
-        var combatPlan=new JsonObject{["planId"]="combat-plan",["steps"]=new JsonArray(new JsonObject{["skill"]="fight_enemies",["arguments"]=new JsonObject{["maxKills"]=2,["maxGameMinutes"]=30,["weaponId"]="(W)0"}})};
+        var combatPlan=new JsonObject{["planId"]="combat-plan",["steps"]=new JsonArray(new JsonObject{["skill"]="fight_enemies",["arguments"]=new JsonObject{["maxKills"]=2,["maxGameMinutes"]=30,["weaponName"]="Rusty Sword"}})};
         Check(ShortPlan.Parse(combatPlan).EncounterPolicy=="interrupt","short plans default encounter policy to interrupt and combat parameters validate");
         var minePlan=new JsonObject{["planId"]="mine-plan",["steps"]=new JsonArray(new JsonObject{["skill"]="mine_travel",["arguments"]=new JsonObject{["targetFloor"]=5}})};
         try{PermissionPolicy.Authorize("mine_travel",minePlan["steps"]![0]!["arguments"]!.AsObject(),Array.Empty<ChestBinding>(),new(){WorldReady=true});throw new Exception("Disabled mine travel was authorized");}
@@ -75,7 +83,7 @@ internal static class PlanChecks
             var handler=new PlanModel(planArgs,bridge);
             var settings=new ModelSettings{Endpoint="http://127.0.0.1:1/chat/completions",Model="local-test"};settings.SetKey("not-real");
             await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(folder,"plan-"+scenario+".db")),settings,new HttpClient(handler),Path.Combine(folder,"plan-"+scenario+".jsonl"));
-            bridge.Publish();runtime.SendMessage("autonomous greedy opening; no fishing");await runtime.Resume();runtime.Start();
+            bridge.Publish();PlanningFixture.Seed(runtime,"autonomous greedy opening; no fishing");runtime.SendMessage("autonomous greedy opening; no fishing");await runtime.Resume();runtime.Start();
             var until=Environment.TickCount64+7000;
             if(scenario=="pause"){
                 while(bridge.Commands.Count<1&&Environment.TickCount64<until)await Task.Delay(10);
@@ -89,8 +97,7 @@ internal static class PlanChecks
                 Check(bridge.Commands.Count==8&&handler.BetweenStepRequests==0,"eight verified steps execute with one model selection and no between-step requests");
                 await Task.Delay(700);
                 Check(handler.Requests>=2,"plan completion wakes the next decision without twenty-second delay");
-                Check(handler.Continuations==1&&handler.ContinuationWhileRunning,"model plans a continuation while the previous batch is executing");
-                Check(handler.SawContinuation,"next decision receives the hypothetical continuation for verification against actual results");
+                Check(handler.Continuations==0&&!handler.SawContinuation,"a short batch reaches its next decision without speculative planning");
                 Check(bridge.Commands.Count==8,"duplicate plan id is not executed a second time");
                 if(scenario=="save_then_execute")Check(runtime.Plans.Single().Revision>=2,"saving a public plan allows a group tool in the same model response");
                 if(scenario=="invalid_json")Check(handler.Requests>=2&&runtime.Decisions.Read().Any(e=>e.Kind=="tool_rejected")&&!runtime.Decisions.Read().Any(e=>e.Kind=="model_error"),"malformed arguments are returned to the model for correction without a global one-minute failure cooldown");
@@ -109,7 +116,7 @@ internal static class PlanChecks
             var handler=new ModalRetryModel(bridge);
             var settings=new ModelSettings{Endpoint="http://127.0.0.1:1/chat/completions",Model="local-test"};settings.SetKey("not-real");
             await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(folder,"plan-modal-retry.db")),settings,new HttpClient(handler),Path.Combine(folder,"plan-modal-retry.jsonl"));
-            bridge.Publish();runtime.SendMessage("dismiss the shop dialogue");await runtime.Resume();runtime.Start();
+            bridge.Publish();PlanningFixture.Seed(runtime,"dismiss the shop dialogue");runtime.SendMessage("dismiss the shop dialogue");await runtime.Resume();runtime.Start();
             var until=Environment.TickCount64+5000;
             while(bridge.Commands.Count<2&&Environment.TickCount64<until)await Task.Delay(10);
             Check(bridge.Commands.Count==2&&!runtime.Decisions.Read().Any(e=>e.Kind=="tool_result"&&e.Data.GetProperty("result").GetProperty("status").GetString()=="duplicate_not_executed"),"same plan id can be retried when a new modal appears after the prior plan completed");
@@ -119,7 +126,7 @@ internal static class PlanChecks
             var settings=new ModelSettings{Endpoint="http://127.0.0.1:1/chat/completions",Model="local-test"};settings.SetKey("not-real");
             await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(folder,"observation-does-not-trigger.db")),settings,new HttpClient(handler),Path.Combine(folder,"observation-does-not-trigger.jsonl"));
             bridge.Observation!.WorldView="""{"inventoryState":{"freeSlots":0}}""";
-            bridge.Publish();runtime.SendMessage("当前不要使用箱子");await runtime.Resume();runtime.Start();
+            bridge.Publish();PlanningFixture.Seed(runtime,"当前不要使用箱子");runtime.SendMessage("当前不要使用箱子");await runtime.Resume();runtime.Start();
             var toolsDeadline=Environment.TickCount64+4000;while(handler.LastRequest is null&&Environment.TickCount64<toolsDeadline)await Task.Delay(10);
             var storage=handler.LastRequest?["tools"]?.AsArray().FirstOrDefault(t=>t?["function"]?["name"]?.ToString()=="group_storage_economy");
             var variants=storage?["function"]?["parameters"]?["properties"]?["steps"]?["items"]?["oneOf"] as JsonArray??new();
@@ -141,7 +148,7 @@ internal static class PlanChecks
             var bridge=new PlanBridge("modal_menu");var handler=new ModalWaitModel();
             var settings=new ModelSettings{Endpoint="http://127.0.0.1:1/chat/completions",Model="local-test"};settings.SetKey("not-real");
             await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(folder,"modal-wait.db")),settings,new HttpClient(handler),Path.Combine(folder,"modal-wait.jsonl"));
-            bridge.Publish();await runtime.Resume();runtime.Start();
+            bridge.Publish();PlanningFixture.Seed(runtime,"处理弹窗");await runtime.Resume();runtime.Start();
             var deadline=Environment.TickCount64+5000;while(!bridge.Commands.Contains("respond_dialogue")&&Environment.TickCount64<deadline)await Task.Delay(10);
             Check(bridge.Commands.Contains("respond_dialogue")&&runtime.Decisions.Read().Any(e=>e.Kind=="tool_rejected"&&e.Data.GetProperty("reason").GetString()?.StartsWith("modal_menu_blocks_wait")==true),"waiting is rejected while a blocking menu is open and the model resolves the dialogue instead");
             await runtime.Pause();
@@ -150,7 +157,7 @@ internal static class PlanChecks
             var bridge=new PlanBridge("idle");var handler=new SynchronousPlanModel();
             var settings=new ModelSettings{Endpoint="http://127.0.0.1:1/chat/completions",Model="local-test"};settings.SetKey("not-real");
             await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(folder,"sync-tool-followup.db")),settings,new HttpClient(handler),Path.Combine(folder,"sync-tool-followup.jsonl"));
-            bridge.Publish();runtime.SendMessage("prepare the opening plan");await runtime.Resume();runtime.Start();
+            bridge.Publish();PlanningFixture.Seed(runtime,"prepare the opening plan");runtime.SendMessage("prepare the opening plan");await runtime.Resume();runtime.Start();
             var deadline=Environment.TickCount64+7000;while(handler.Requests<6&&Environment.TickCount64<deadline)await Task.Delay(10);
             await Task.Delay(700);
             Check(handler.Requests==6&&runtime.Decisions.Read().Any(e=>e.Kind=="decision_context"&&e.Data.GetProperty("trigger").GetProperty("kind").GetString()=="tool_followup"),"a synchronous tool result on the final model round queues one follow-up decision instead of leaving the plan stalled");
@@ -161,7 +168,7 @@ internal static class PlanChecks
             var bridge=new PlanBridge("no_action_retry");var handler=new NoActionModel();
             var settings=new ModelSettings{Endpoint="http://127.0.0.1:1/chat/completions",Model="local-test"};settings.SetKey("not-real");
             await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(folder,"no-action-retry.db")),settings,new HttpClient(handler),Path.Combine(folder,"no-action-retry.jsonl"));
-            bridge.Publish();await runtime.Resume();runtime.Start();var deadline=Environment.TickCount64+10000;
+            bridge.Publish();PlanningFixture.Seed(runtime,"等待下一项工作");await runtime.Resume();runtime.Start();var deadline=Environment.TickCount64+10000;
             while(handler.Requests<4&&Environment.TickCount64<deadline)await Task.Delay(20);
             Check(handler.Requests>=4&&runtime.Decisions.Read().Any(e=>e.Kind=="no_action_retry_scheduled"),"autonomous text-only replies schedule a bounded retry without relying on property-change observations");
             await runtime.Pause();
@@ -178,7 +185,7 @@ internal static class PlanChecks
             var bridge=new PlanBridge("ordered_actions");var handler=new OrderedActionModel(askFirst);
             var settings=new ModelSettings{Endpoint="http://127.0.0.1:1/chat/completions",Model="local-test"};settings.SetKey("not-real");
             await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(folder,"ordered-actions-"+askFirst+".db")),settings,new HttpClient(handler),Path.Combine(folder,"ordered-actions-"+askFirst+".jsonl"));
-            bridge.Publish();await runtime.Resume();runtime.Start();
+            bridge.Publish();PlanningFixture.Seed(runtime,"按序处理调用");await runtime.Resume();runtime.Start();
             var deadline=Environment.TickCount64+5000;
             while((askFirst?runtime.PendingQuestion=="":bridge.Commands.IsEmpty)&&Environment.TickCount64<deadline)await Task.Delay(10);
             await Task.Delay(400);
@@ -187,7 +194,7 @@ internal static class PlanChecks
             await runtime.Pause();
         }
         {
-            var bridge=new PlanBridge("new_day");var handler=new IdleModel();
+            var bridge=new PlanBridge("new_day");var handler=new IdleModel(completeMaintenance:true);
             var settings=new ModelSettings{Endpoint="http://127.0.0.1:1/chat/completions",Model="local-test"};settings.SetKey("not-real");
             await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(folder,"day-maintenance-followup.db")),settings,new HttpClient(handler),Path.Combine(folder,"day-maintenance-followup.jsonl"));
             bridge.Observation!.WorldView="""{"decisionFacts":{"calendar":{"season":"spring"}}}""";
@@ -202,7 +209,7 @@ internal static class PlanChecks
             bridge.Observation!.GameDay=1;bridge.PublishNextObservation();
             deadline=Environment.TickCount64+5000;
             while(!runtime.Decisions.Read().Any(e=>e.Kind=="model_prompt_capture"&&e.Data.GetProperty("gameDay").GetInt32()==1&&e.Data.GetProperty("kind").GetString()=="daily_action")&&Environment.TickCount64<deadline)await Task.Delay(10);
-            Check(runtime.Decisions.Read().Any(e=>e.Kind=="model_prompt_capture"&&e.Data.GetProperty("gameDay").GetInt32()==1&&e.Data.GetProperty("kind").GetString()=="sleep_maintenance")&&runtime.Decisions.Read().Any(e=>e.Kind=="model_prompt_capture"&&e.Data.GetProperty("gameDay").GetInt32()==1&&e.Data.GetProperty("kind").GetString()=="daily_action"),"new-day maintenance schedules the next gameplay decision even when maintenance ends without a tool call");
+            Check(runtime.Decisions.Read().Any(e=>e.Kind=="season_progress_updated")&&runtime.Decisions.Read().Any(e=>e.Kind=="model_prompt_capture"&&e.Data.GetProperty("gameDay").GetInt32()==1&&e.Data.GetProperty("kind").GetString()=="daily_action"),"saving the verified previous day's progress schedules the next gameplay decision");
             var maintenance=JsonNode.Parse(runtime.Memory.Get(runtime.Scope,"season_maintenance")!)!;
             Check(maintenance["successfulResults"]!.AsArray().Count==15,"daily maintenance retains all successful receipts beyond the twelve-item recent window");
             var freshWorking=JsonNode.Parse(runtime.Memory.Get(runtime.Scope,"agent_working_state")!)!;
@@ -211,7 +218,7 @@ internal static class PlanChecks
         }
         await using(var trial=new CompanionRuntime(trialBridge,new MemoryStore(Path.Combine(folder,"ten-day-boundary.db")),new ModelSettings(),new HttpClient(),Path.Combine(folder,"ten-day-boundary.jsonl"))){
             trial.PlanningEnabled=false;trial.AutonomousTrialEndDay=10;trialBridge.Observation.ControlMode="solo_test";
-            trialBridge.Publish();await trial.Resume();trial.Start();await Task.Delay(300);
+            trialBridge.Publish();PlanningFixture.Seed(trial,"完成十天测试");await trial.Resume();trial.Start();await Task.Delay(300);
             Check(trial.Running,"ten-day trial continues after day five");
             trialBridge.Observation.GameDay=10;trialBridge.Observation.Menu="SaveGameMenu";await Task.Delay(300);
             Check(trial.Running&&!trial.Decisions.Read().Any(e=>e.Kind=="trial_completed"),"trial boundary waits for native save/menu completion");
@@ -257,7 +264,7 @@ internal static class PlanChecks
             return new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(response))};
         }
     }
-    private sealed class IdleModel:HttpMessageHandler
+    private sealed class IdleModel(bool completeMaintenance=false):HttpMessageHandler
     {
         private int _requests;
         public int Requests=>Volatile.Read(ref _requests);
@@ -265,7 +272,10 @@ internal static class PlanChecks
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken ct){
             LastRequest=JsonNode.Parse(request.Content!.ReadAsStringAsync(ct).GetAwaiter().GetResult())!.AsObject();
             Interlocked.Increment(ref _requests);
-            var response=new{choices=new[]{new{message=new{role="assistant",content="等待明确事件。"}}}};
+            var calls=completeMaintenance&&LastRequest["tools"]?.AsArray().Any(t=>t?["function"]?["name"]?.ToString()=="update_season_progress")==true
+                ?new object[]{new{id="season-progress",type="function",function=new{name="update_season_progress",arguments="""{"progress":["已核对十五条浇水回执"]}"""}}}
+                :Array.Empty<object>();
+            var response=new{choices=new[]{new{message=new{role="assistant",content="等待明确事件。",tool_calls=calls}}}};
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(response))});
         }
     }
@@ -288,7 +298,7 @@ internal static class PlanChecks
             var number=Interlocked.Increment(ref _requests);
             object call=number==1
                 ?new{id="wait",type="function",function=new{name="wait_for_change",arguments=JsonSerializer.Serialize(new{seconds=120,reason="wait for shop opening"})}}
-                :new{id="dialogue",type="function",function=new{name="group_social_progress",arguments=JsonSerializer.Serialize(new{planId="close_dialogue",steps=new[]{new{skill="respond_dialogue",arguments=new{responseKey=""}}}})}};
+                :new{id="dialogue",type="function",function=new{name="group_social_progress",arguments=JsonSerializer.Serialize(new{planId="close_dialogue",steps=new[]{new{skill="respond_dialogue",arguments=new{responseName=""}}}})}};
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(new{choices=new[]{new{message=new{role="assistant",content="",tool_calls=new[]{call}}}}}))});
         }
     }
@@ -319,17 +329,19 @@ internal static class PlanChecks
         {
             var number=Interlocked.Increment(ref _requests);
             if(number==2){bridge.Observation!.Menu="DialogueBox";bridge.Observation.Revision++;}
-            var call=new{id="dialogue",type="function",function=new{name="group_social_progress",arguments=JsonSerializer.Serialize(new{planId="close_dialogue",steps=new[]{new{skill="respond_dialogue",arguments=new{responseKey=""}}}})}};
+            var call=new{id="dialogue",type="function",function=new{name="group_social_progress",arguments=JsonSerializer.Serialize(new{planId="close_dialogue",steps=new[]{new{skill="respond_dialogue",arguments=new{responseName=""}}}})}};
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(new{choices=new[]{new{message=new{role="assistant",content="",tool_calls=new[]{call}}}}}))});
         }
     }
-    private sealed class PlanBridge(string scenario):IGameBridge
+    private sealed class PlanBridge(string scenario,bool holdPlan=false):IGameBridge
     {
         public string Scenario=>scenario;
         public GameObservation? Observation{get;}=new(){SessionId="plan-session",SaveId="plan-save",PlayerId=8,Revision=1,WorldReady=true,Location="Farm",Stamina=270,Health=100,TimeOfDay=900,WorldView="{}"};
         public bool Connected=>true;public bool Fresh=>true;
         public event Action<GameObservation>? Observed;
         public event Action<TaskResult>? Result;
+        private readonly TaskCompletionSource _firstStep=new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public void ReleaseFirstStep()=>_firstStep.TrySetResult();
         public ConcurrentQueue<string> Commands{get;}=new();
         public void Publish(){if(scenario=="low_stamina_late"){Observation!.Stamina=-5;Observation.TimeOfDay=2530;}if(scenario is "modal_menu" or "modal_retry")Observation!.Menu="DialogueBox";Observed?.Invoke(Observation!);}
         public void PublishNextObservation(){Observation!.Revision++;Observed?.Invoke(Observation);}
@@ -342,6 +354,7 @@ internal static class PlanChecks
             if(scenario=="modal_retry")Observation.Menu="";
             var id=taskId;
             _=Task.Run(async()=>{
+                if(holdPlan&&number==1)await _firstStep.Task.WaitAsync(TimeSpan.FromSeconds(10));
                 await Task.Delay(scenario=="pause"?800:35);
                 var revision=Observation.Revision;Observation.Revision++;Observation.ActiveTaskId="";
                 Result?.Invoke(new(){TaskId=id,Skill=skill,Status=scenario=="failure"&&number==2?"failed":"completed",Reason="native_test_result",Completed=1,ObservationRevision=revision});

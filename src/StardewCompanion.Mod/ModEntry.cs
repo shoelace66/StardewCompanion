@@ -11,7 +11,7 @@ using Microsoft.Xna.Framework;
 
 namespace StardewCompanion.Mod;
 
-public sealed class ModEntry : StardewModdingAPI.Mod
+public sealed partial class ModEntry : StardewModdingAPI.Mod
 {
     private BridgeClient? _bridge;
     private string _session = Guid.NewGuid().ToString("N");
@@ -95,6 +95,9 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         _resultOrder.Clear();
         _sleepLockedDay = null;
         _manualControl=false;
+        _namingSubmission=null;
+        _submittedNamingMenuId="";
+        TrackNamingMenu(null);
     }
 
     private static bool AllowAiBackgroundInput(ref bool __result)
@@ -198,8 +201,11 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                     }
                     catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException or FormatException or OverflowException)
                     {
+                        object details=ex is ExecutionTargets.TargetOutsideMapException bounds
+                            ?new{error="InvalidOperationException",message=ex.Message,navigationFailure=bounds.Evidence}
+                            :new{error=ex.GetType().Name,message=ex.Message};
                         Emit(command?.TaskId ?? envelope.MessageId, "rejected", "invalid_arguments:"+ex.Message,
-                            JsonSerializer.Serialize(new{error=ex.GetType().Name,message=ex.Message}),skill:command?.Skill??"");
+                            JsonSerializer.Serialize(details),skill:command?.Skill??"");
                     }
                 }
             }
@@ -211,12 +217,15 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         // so losing window focus during startup cannot freeze that transition.
         Game1.options.pauseWhenOutOfFocus = false;
         if (!Context.IsWorldReady) return;
+        TrackNamingMenu(Game1.activeClickableMenu as NamingMenu);
+        VerifyPetName();
         if(SoloTestMode.Enabled && Game1.activeClickableMenu is LevelUpMenu level && !level.isProfessionChooser)
             level.receiveGamePadButton(Buttons.B);
         // Keep background simulation active, without saving any user option changes.
         Helper.Reflection.GetField<StardewValley.Util.IInputSimulator>(typeof(Game1), "inputSimulator").SetValue(_input);
         _input.Clear();
-        _manualControl=_input.ManualControl=_paused&&SoloTestMode.Enabled;
+        _manualControl=_input.ManualControl=_paused&&SoloTestMode.Enabled||
+            Game1.activeClickableMenu is NamingMenu&&_active==null&&_namingSubmission==null;
         var handlingStoryPrompt=HandleStoryPrompt(healthy);
         if(_manualControl)return;
         foreach (var key in Keyboard.GetState().GetPressedKeys())
@@ -299,10 +308,10 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         };
     }
 
-    private static string DescribeMenuContext()
+    private string DescribeMenuContext()
     {
-        if(Game1.activeClickableMenu?.GetType().Name=="NamingMenu")
-            return JsonSerializer.Serialize(new{type="NamingMenu",text="原版命名界面需要玩家输入名称；自动工具不能填写。",question=false,choices=Array.Empty<object>(),playerInputRequired=true});
+        if(Game1.activeClickableMenu is NamingMenu naming)
+            return JsonSerializer.Serialize(ObserveNamingMenu(naming));
         if(Game1.activeClickableMenu is not DialogueBox dialogue)
             return JsonSerializer.Serialize(new{type=Game1.activeClickableMenu?.GetType().Name??"",text="",question=false,choices=Array.Empty<object>()});
         var text=dialogue.getCurrentString()??"";
@@ -320,8 +329,9 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             : !_bridge!.Healthy ? "bridge_unhealthy"
             : command.ExpiresAtUtcMs < DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() ? "expired_command"
             : command.ObservationRevision > _revision || _revision - command.ObservationRevision > 20 ? "stale_observation" : null;
-        if (reason != null) { Emit(command.TaskId, "rejected", reason); return; }
+        if (reason != null) { Emit(command.TaskId, "rejected", reason,skill:command.Skill); return; }
         using var args = JsonDocument.Parse(command.Arguments);
+        if(command.Skill==PetNaming.Skill){SubmitPetName(command,args.RootElement);return;}
         if(Game1.activeClickableMenu?.GetType().Name=="NamingMenu"
             &&command.Skill is not ("observe" or "inspect_target" or "inspect_targets" or "inspect_route" or "inspect_area" or "read_mailbox")
             &&BusinessCapabilities.Find(command.Skill) is not {Query:true})
@@ -366,8 +376,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             var blocked=queryResult.RootElement.ValueKind==JsonValueKind.Object&&queryResult.RootElement.TryGetProperty("status",out var queryStatus)&&queryStatus.GetString()=="blocked";
             Emit(command.TaskId, blocked?"rejected":"completed", blocked?"requires_current_observed_location":"observation", serialized,skill:command.Skill); return;
         }
-        if (_paused || _active != null || _sleepLockedDay == Game1.Date.TotalDays)
-        { Emit(command.TaskId, "rejected", _paused ? "paused" : _active != null ? "busy" : "waiting_for_next_day"); return; }
+        if (_paused || _active != null || _namingSubmission!=null || _sleepLockedDay == Game1.Date.TotalDays)
+        { Emit(command.TaskId, "rejected", _paused ? "paused" : _active != null||_namingSubmission!=null ? "busy" : "waiting_for_next_day"); return; }
         if(_cleanup!=null) { Emit(command.TaskId,"rejected","container_cleanup_pending");return; }
         if (command.Skill == "bind_chest")
         {
@@ -382,7 +392,12 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             var normalized=ExecutionTargets.NormalizePrimitive(command.Skill,command.Arguments,out var targetFailure);
             if(targetFailure!=null){Emit(command.TaskId,"rejected",targetFailure.Reason,JsonSerializer.Serialize(targetFailure),skill:command.Skill);return;}
             command.Arguments=normalized.GetRawText();
-            _routine = new RoutineExecutor(command.Skill, command.Arguments, NativeInteract, command.EncounterPolicy);
+            var routine = new RoutineExecutor(command.Skill, command.Arguments, NativeInteract, command.EncounterPolicy);
+            if(command.Skill=="sell_items"&&routine.TargetFailure is {} saleFailure){
+                Emit(command.TaskId,"rejected",saleFailure.Reason,JsonSerializer.Serialize(new{targetResolution=saleFailure}),skill:command.Skill);
+                return;
+            }
+            _routine=routine;
             _active = command; _taskBefore=Observe();_start = _taskBefore.Tile;
             Emit(command.TaskId, "accepted", "routine_started"); return;
         }
@@ -410,6 +425,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         var collectedItems=_routine?.CollectedItems;
         var affectedTiles=_routine?.AffectedTiles??Array.Empty<object>();
         var businessDetails=_routine?.BusinessDetails;
+        var navigationFailure=_routine?.NavigationFailure;
         var remainingDrops=_routine?.RemainingDrops();
         if(_routine?.Cleanup()==false)_cleanup=_routine;
         _routine = null;
@@ -422,7 +438,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         Emit(task.TaskId,status,reason,
             JsonSerializer.Serialize(new { requestedTarget=JsonSerializer.Deserialize<JsonElement>(task.Arguments),playerStart = _start, playerEnd = after.Tile, after.Location,collectedItems,remainingDrops,
                 affectedTiles,
-                businessDetails,
+                businessDetails,navigationFailure,
                 actualCost=new{staminaBefore=_taskBefore?.Stamina,staminaAfter=after.Stamina,netStaminaUsed=_taskBefore==null?(float?)null:_taskBefore.Stamina-after.Stamina,
                     healthBefore=_taskBefore?.Health,healthAfter=after.Health,gameTimeBeforeHHMM=_taskBefore?.TimeOfDay,gameTimeAfterHHMM=after.TimeOfDay,
                     gameTimeBeforeDisplay=_taskBefore==null?null:$"{_taskBefore.TimeOfDay/100:D2}:{_taskBefore.TimeOfDay%100:D2}",gameTimeAfterDisplay=$"{after.TimeOfDay/100:D2}:{after.TimeOfDay%100:D2}",

@@ -16,7 +16,8 @@ internal static class AwarenessChecks
         var model=new CaptureModel();var bridge=new AwarenessBridge();
         var settings=new ModelSettings{Endpoint="http://localhost:5011/v1/chat/completions",Model="awareness-check"};settings.SetKey("secret-must-not-be-captured");
         await using(var runtime=new CompanionRuntime(bridge,new MemoryStore(dbPath),settings,new HttpClient(model),log)){
-            bridge.Publish();runtime.Start();await runtime.Resume();runtime.SendMessage("采黄水仙然后回家睡觉");
+            bridge.Publish();PlanningFixture.Seed(runtime,"采黄水仙然后回家睡觉");
+            await runtime.Resume();runtime.SendMessage("采黄水仙然后回家睡觉");runtime.Start();
             await Until(()=>model.Requests.Count>=3,"failure and duplicate rejection both trigger a new model request");
             await runtime.Pause();
             var requests=model.Requests.ToArray();var feedback=Context(requests[1])["agentState"]!.ToJsonString();

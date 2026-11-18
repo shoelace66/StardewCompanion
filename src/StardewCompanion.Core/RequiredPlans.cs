@@ -30,11 +30,20 @@ public sealed partial class CompanionRuntime
         get {
             var state=_bridge.Observation;var blocker=PlanningBlocker(state);
             return new JsonObject{
+                ["seasonPlan"]=OrderSeasonPlan(GetSeasonPlan()),
                 ["ready"]=blocker=="",["blocker"]=blocker,["goalVersion"]=CurrentGoalVersion,
                 ["objective"]=PlayerGoal["objective"]?.DeepClone(),["gameDay"]=state?.GameDay,
-                ["seasonCurrent"]=HasPlayerGoal&&state!=null&&SeasonPlanCurrent(state),
-                ["seasonPlan"]=GetSeasonPlan()};
+                ["seasonCurrent"]=HasPlayerGoal&&state!=null&&SeasonPlanCurrent(state)};
         }
+    }
+    private static JsonObject? OrderSeasonPlan(JsonNode? plan,bool includeProgress=true)
+    {
+        if(plan is not JsonObject source)return null;
+        var ordered=new JsonObject();
+        foreach(var (key,value) in source.OrderBy(field=>field.Key,StringComparer.Ordinal))
+            if(key!="progress")ordered[key]=value?.DeepClone();
+        if(includeProgress&&source.ContainsKey("progress"))ordered["progress"]=source["progress"]?.DeepClone();
+        return ordered;
     }
     internal void EnsureRequiredPlans(GameObservation state)
     {
@@ -62,7 +71,6 @@ public sealed partial class CompanionRuntime
         var instruction=needsProgress?"必须调用 update_season_progress 核验上一季进度，只追加 seasonMaintenance.successfulResults 支持的事实，无成功回执则传空数组。":"必须调用 create_season_plan 保存完整季计划。目标、约束、成功条件、分阶段日程、资金与体力策略都必须明确。";
         var context=BuildDecisionInput(state,AwarenessSnapshot(),ConversationSnapshot(),tools,instruction);
         context["instruction"]=instruction;
-        context["planning"]=PlanningPreview;
         context["seasonMaintenance"]=maintenance.DeepClone();
         lock(_inputGate)_lastInput=(JsonObject)context.DeepClone();
         var messages=new JsonArray{new JsonObject{["role"]="system",["content"]=DecisionInstructions.RequiredPlanning},new JsonObject{["role"]="user",["content"]=DecisionContextCompression.Serialize(context)}};

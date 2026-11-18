@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using StardewValley;
 using StardewValley.Buildings;
 using StardewValley.Locations;
@@ -9,8 +10,16 @@ namespace StardewCompanion.Mod;
 
 internal static class ExecutionTargets
 {
-    internal sealed record Choice(string Id,string Name,string? Alias=null);
+    internal sealed record Choice(string Id,string Name,string? Alias=null,
+        [property:JsonIgnore(Condition=JsonIgnoreCondition.WhenWritingNull)] int? Quality=null,
+        [property:JsonIgnore(Condition=JsonIgnoreCondition.WhenWritingNull)] int? Quantity=null);
     internal sealed record ResolutionFailure(string Field,string Requested,string Reason,Choice[] Candidates,string CatalogMeaning,int CandidateCount=0,bool CandidatesTruncated=false);
+    internal sealed class TargetOutsideMapException(string map,string path,int x,int y,int width,int height,int maxX,int maxY)
+        :InvalidOperationException($"target_outside_map:{map};path={path};x={x};y={y};width={width};height={height};valid_x=0..{maxX};valid_y=0..{maxY}")
+    {
+        internal object Evidence {get;}=new{blockedMap=map,target=new{x,y,width,height},bounds=new{minX=0,minY=0,maxX,maxY},
+            releaseCondition="use_observed_coordinates_inside_the_destination_map"};
+    }
 
     internal static string? Resolve(string requested,IEnumerable<Choice> source,out Choice[] candidates)
     {
@@ -89,6 +98,10 @@ internal static class ExecutionTargets
         if(root["shopId"] is JsonValue shopName&&shopName.TryGetValue<string>(out var requestedShop)&&requestedShop!=""){
             var shops=KnownShops();var id=Resolve(requestedShop,shops,out var offered);if(id==null){var matches=offered.Where(c=>c.Name==requestedShop||c.Alias==requestedShop).ToArray();issue??=new("shopName",requestedShop,"target_name_unknown_or_ambiguous",(matches.Length>0?matches:offered).Take(64).ToArray(),"supported native shop names; choose an exact listed name",matches.Length>0?matches.Length:offered.Length,offered.Length>64);}else root["shopId"]=id;
         }
+        if(skill=="sell_items"){
+            failure=issue??NormalizeSaleItems(root);
+            return JsonSerializer.SerializeToElement(root);
+        }
         if(skill=="donate_bundle"&&root["bundleId"] is JsonValue bundleName&&bundleName.TryGetValue<string>(out var requestedBundle)&&int.TryParse(requestedBundle,out _)==false){
             var candidates=BundleChoices();var id=Resolve(requestedBundle,candidates,out var offered);if(id==null){var matches=offered.Where(c=>c.Name==requestedBundle||c.Alias==requestedBundle).ToArray();issue=new("bundleName",requestedBundle,"target_name_unknown_or_ambiguous",(matches.Length>0?matches:offered).Take(64).ToArray(),"currently observed native community bundles; include the room name when bundle titles repeat",matches.Length>0?matches.Length:offered.Length,offered.Length>64);}else root["bundleId"]=int.Parse(id,System.Globalization.CultureInfo.InvariantCulture);
         }
@@ -118,6 +131,49 @@ internal static class ExecutionTargets
         }
         NormalizeItems(root);failure=issue;
         return JsonSerializer.SerializeToElement(root);
+    }
+
+    internal static bool IsSaleItem(Item item)=>item is not Tool&&!item.modData.ContainsKey("StardewCompanion/Protected");
+
+    private static ResolutionFailure? NormalizeSaleItems(JsonObject root)
+    {
+        var stock=Game1.player.Items.Where(item=>item!=null)
+            .GroupBy(item=>(item.QualifiedItemId,item.Quality))
+            .Select(group=>new Choice(group.Key.QualifiedItemId,group.First().DisplayName,group.First().Name,
+                group.Key.Quality,group.Where(IsSaleItem).Sum(item=>item.Stack)))
+            .ToArray();
+        var items=root["items"]!.AsArray();
+        var normalized=new JsonArray();
+        var merged=new Dictionary<(string Id,int Quality),JsonObject>();
+        foreach(var entry in items.OfType<JsonObject>()){
+            var requested=entry["itemId"]!.GetValue<string>().Trim();
+            var quality=entry["quality"]!.GetValue<int>();
+            var matching=stock.Where(item=>item.Quality==quality&&
+                (item.Id==requested||string.Equals(item.Name,requested,StringComparison.OrdinalIgnoreCase)||
+                 string.Equals(item.Alias,requested,StringComparison.OrdinalIgnoreCase))).ToArray();
+            var exact=matching.FirstOrDefault(item=>item.Id==requested);
+            if(exact!=null)matching=new[]{exact};
+            if(matching.Length!=1||matching[0].Quantity==0){
+                var choices=matching.Length>0?matching:stock.Where(item=>item.Quantity>0).ToArray();
+                var reason=matching.Length switch{0=>"sale_item_missing",1=>"sale_item_protected",_=>"sale_item_name_ambiguous"};
+                return new("itemName",requested,reason,choices.Take(36).ToArray(),
+                    "current_backpack; use an exact displayed name and quality or an observed qualified item ID",
+                    choices.Length,choices.Length>36);
+            }
+            var id=matching[0].Id;
+            var count=entry["count"]!.GetValue<int>();
+            var retain=entry["retain"]!.GetValue<int>();
+            if(merged.TryGetValue((id,quality),out var earlier)){
+                earlier["count"]=checked(earlier["count"]!.GetValue<int>()+count);
+                earlier["retain"]=Math.Max(earlier["retain"]!.GetValue<int>(),retain);
+            }else{
+                var row=new JsonObject{["itemId"]=id,["quality"]=quality,["count"]=count,["retain"]=retain};
+                normalized.Add(row);
+                merged.Add((id,quality),row);
+            }
+        }
+        root["items"]=normalized;
+        return null;
     }
 
     private static void NormalizePublicReferences(JsonObject root,string skill)
@@ -191,7 +247,7 @@ internal static class ExecutionTargets
             var height=args.TryGetProperty("height",out var h)&&h.TryGetInt32(out var hi)?hi:1;
             var layer=location.Map.Layers[0];
             if(left<0||top<0||width<1||height<1||(long)left+width>layer.LayerWidth||(long)top+height>layer.LayerHeight)
-                throw new InvalidOperationException($"target_outside_map:{location.NameOrUniqueName};path={path};x={left};y={top};width={width};height={height};valid_x=0..{layer.LayerWidth-1};valid_y=0..{layer.LayerHeight-1}");
+                throw new TargetOutsideMapException(location.NameOrUniqueName,path,left,top,width,height,layer.LayerWidth-1,layer.LayerHeight-1);
         }
         foreach(var property in args.EnumerateObject())if(property.Name!="_bindings"&&property.Value.ValueKind is JsonValueKind.Object or JsonValueKind.Array)
             ValidateBounds(property.Value,map,path+"."+property.Name);

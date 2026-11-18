@@ -14,6 +14,7 @@ internal sealed partial class BusinessExecutor
     private readonly string _skill;
     private readonly JsonElement _args;
     private readonly ExecutionTargets.ResolutionFailure? _targetFailure;
+    internal ExecutionTargets.ResolutionFailure? TargetFailure=>_targetFailure;
     private readonly string? _constructionTargetFailure;
     private readonly Action<GridPoint> _interact;
     private readonly Farm? _buildingTargetFarm;

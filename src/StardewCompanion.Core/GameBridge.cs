@@ -19,6 +19,7 @@ public interface IGameBridge
     event Action<GameObservation>? Observed;
     event Action<TaskResult>? Result;
     Task<string> Control(string type);
+    Task<string> CancelTask(string expectedTaskId)=>throw new NotSupportedException("Targeted cancellation is not supported by this bridge");
     Task<string> AcknowledgeEvents(string[] ids)=>Task.FromResult("");
     Task<TaskResult> Dispatch(string skill, object arguments, bool waitForTerminal = false, CancellationToken cancellation = default, string? taskId = null, string encounterPolicy = "interrupt");
 }
@@ -90,6 +91,7 @@ public sealed class GameBridge : IGameBridge, IAsyncDisposable
         _app.MapGet("/agent/state",()=>_agent==null?Results.Problem("Agent is not attached",statusCode:503):Results.Json(new{
             _agent.Status,_agent.Running,_agent.Thinking,_agent.PlanningEnabled,_agent.Mode,_agent.Scope,_agent.PendingQuestion,goalVersion=_agent.PlayerGoal["version"]?.GetValue<int>()??0,awareness=_agent.AwarenessSnapshot(),latestEvent=_agent.Decisions.Latest,observation=Observation}));
         _app.MapGet("/agent/plans",()=>_agent==null?Results.Problem("Agent is not attached",statusCode:503):Results.Json(_agent.Plans));
+        _app.MapGet("/agent/planning",()=>_agent==null?Results.Problem("Agent is not attached",statusCode:503):Results.Json(_agent.PlanningPreview));
         _app.MapGet("/agent/goal",()=>_agent==null?Results.Problem("Agent is not attached",statusCode:503):Results.Json(_agent.PlayerGoal));
         _app.MapGet("/agent/input",()=>_agent==null?Results.Problem("Agent is not attached",statusCode:503):Results.Json(_agent.InputPreview));
         _app.MapPost("/agent/goal",async(PlayerGoalUpdate goal)=>{
@@ -125,8 +127,14 @@ public sealed class GameBridge : IGameBridge, IAsyncDisposable
             _app.MapPost("/"+type, async () => Results.Accepted(value:new {requestId=await Control(type)}));
         _app.MapPost("/task", async (BridgeTask request) =>
         {
+            if(request.Skill!="bind_chest"&&!ToolCatalog.Queries.Contains(request.Skill)&&!ToolCatalog.Actions.Contains(request.Skill)&&BusinessCapabilities.Find(request.Skill)==null)
+                return Results.BadRequest(new{error="unknown_skill:"+request.Skill});
             var state=Observation;
             if (!Fresh || state?.WorldReady!=true) return Results.Conflict(new {error="No fresh game observation; loading or game not updating"});
+            if(_agent?.PlanningEnabled==true&&!ToolCatalog.Queries.Contains(request.Skill)&&BusinessCapabilities.Find(request.Skill) is not {Query:true}){
+                try{_agent.EnsureRequiredPlans(state);}
+                catch(InvalidOperationException ex){return Results.Conflict(new{error=ex.Message});}
+            }
             var command=Command(state,request.Skill,request.Arguments,request.TaskId);
             _agent?.RecordExternalTask(command);
             await Send("task",command); return Results.Accepted(value:new {command.TaskId});
@@ -138,6 +146,11 @@ public sealed class GameBridge : IGameBridge, IAsyncDisposable
     {TaskId=taskId??Guid.NewGuid().ToString("N"),SessionId=state.SessionId,SaveId=state.SaveId,PlayerId=state.PlayerId,ObservationRevision=state.Revision,ExpiresAtUtcMs=DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()+5000,Skill=skill,Arguments=JsonSerializer.Serialize(arguments),EncounterPolicy=encounterPolicy};
     public Task<string> AcknowledgeEvents(string[] ids)=>Send("events_ack",new{ids});
     public Task<string> Control(string type) => Send(type,new {});
+    public Task<string> CancelTask(string expectedTaskId)
+    {
+        if(string.IsNullOrWhiteSpace(expectedTaskId))throw new ArgumentException("Expected task identity is required",nameof(expectedTaskId));
+        return Send("cancel",new{expectedTaskId});
+    }
     public async Task<TaskResult> Dispatch(string skill, object arguments, bool waitForTerminal=false,CancellationToken cancellation=default,string? taskId=null,string encounterPolicy="interrupt")
     {
         var state=Observation;

@@ -11,7 +11,6 @@ if(args.Contains("--agent"))
     var settings=ModelSettings.Load(Path.GetFullPath(Environment.GetEnvironmentVariable("SC_MODEL_SETTINGS")??".local/model.credentials.json"));
     agent=new(bridge,new MemoryStore(Path.Combine(data,"memory.db")),settings,http,Path.Combine(data,"events.jsonl"));
     agent.PlanningEnabled=!args.Contains("--scripted");
-    if(args.Contains("--solo-five-day"))agent.AutonomousTrialEndDay=5;
     var daysIndex=Array.IndexOf(args,"--trial-days");
     if(daysIndex>=0){
         if(daysIndex+1>=args.Length||!int.TryParse(args[daysIndex+1],out var days)||days is <1 or >112)

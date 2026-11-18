@@ -74,9 +74,9 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
         SaveOfflineSnapshot(scope,state);
         if(state.SessionId!=_session||scope!=_scope)
         {
-            _resumed=false;_planningPaused=true;Invalidate();_taskProjects.Clear();_taskDecisions.Clear();_queryFacts.Clear();_capturedPromptKinds.Clear();_lastPlan=null;_decisionRevision=0;_lastActionFingerprint="";_lastActionState="";_lastFailureReason="";_unchangedFailures=0;
+            _resumed=false;_planningPaused=true;Invalidate();_taskProjects.Clear();_taskDecisions.Clear();_queryFacts.Clear();_capturedPromptKinds.Clear();_decisionRevision=0;ResetActionFailures();
             while(_messages.TryDequeue(out _)){} while(_recentResults.TryDequeue(out _)){}
-            _expandedTools=false;_scopedPlanSkills=Array.Empty<string>();_triggerKind="session_started";
+            _triggerKind="session_started";
             lock(_inputGate){_scope=scope;_session=state.SessionId;_day=state.GameDay;_season=CalendarSeason(state);}
             _memory.Reconcile(scope,_session,state.GameDay);
             ReconcileWorkingSession(state);
@@ -87,16 +87,18 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
         }
         else if(_day!=state.GameDay)
         {
+            var waitConditionTriggered=WaitSatisfied(state);
+            if(waitConditionTriggered)RecordWaitCompletion(state,"condition_satisfied");
             var previousDay=_day;
             var previousSeason=_season;
             var counts=_memory.EventSummary(scope,_session,previousDay);
             if(counts.Count>0)_memory.Add(scope,"episode",JsonSerializer.Serialize(new{day=previousDay,session=_session,verifiedTaskCounts=counts,source="actual_execution_results",scope="session_observed"}),"game_task_results",previousDay,"session_observed");
             var success=JsonNode.Parse(_memory.Get(scope,"verified_day_results:"+_session+":"+previousDay)??"[]");
-            _day=state.GameDay;_season=CalendarSeason(state);Invalidate(false);_memory.Reconcile(scope,_session,_day);RetireWorkingDay();
+            _day=state.GameDay;_season=CalendarSeason(state);Invalidate(false);_waitConditionTriggered=waitConditionTriggered;_memory.Reconcile(scope,_session,_day);RetireWorkingDay();
             _memory.Set(scope,"season_maintenance",JsonSerializer.Serialize(new{endedDay=previousDay,endedSeason=previousSeason,currentSeason=_season,successfulResults=success}));
             while(_recentResults.TryDequeue(out _)){}
             _triggerKind="new_day";Trace("day_changed",new{previousDay,day=_day});
-            if(_resumed&&PlanningEnabled)_messages.Enqueue(new(scope,_session,"新的一天已开始，维护上一日季节计划进度。",true));
+            // Maintenance remains pending in memory until its tool succeeds; cancellation must not consume it.
         }
         ObserveAwareness(state);
         Changed?.Invoke();
@@ -104,30 +106,34 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
     private void OnResult(TaskResult result)
     {
         if(string.IsNullOrEmpty(_scope))return;
+        var wakeDecision=false;
         var decision=_taskDecisions.GetValueOrDefault(result.TaskId)??"";
         Trace("task_result",result,decision);
         if(result.Status is "completed" or "partial" or "failed" or "cancelled" or "rejected")
         {
+            if((result.Status!="completed"||IsNoProgressResult(result))&&!ToolCatalog.Queries.Contains(result.Skill))DiscardContinuation(failed:true);
+            FinishAction(result);
             if(_triggerKind=="no_action_retry"&&!ToolCatalog.Queries.Contains(result.Skill)){_retryAfter=0;_emptyDecisionRetries=0;}
-            if(result.Status=="completed"&&result.Completed>0&&!ToolCatalog.Queries.Contains(result.Skill))RecordSuccessfulDayResult(result);
-            if(!ToolCatalog.Queries.Contains(result.Skill)&&!result.Reason.EndsWith("_ack"))WakeDecision(result.ObservationRevision);
+            if((result.Status is "completed" or "partial")&&result.Completed>0&&!ToolCatalog.Queries.Contains(result.Skill))RecordSuccessfulDayResult(result);
+            wakeDecision=!ToolCatalog.Queries.Contains(result.Skill)&&!result.Reason.EndsWith("_ack");
             if(!result.Reason.EndsWith("_ack") && !ToolCatalog.Queries.Contains(result.Skill))
             {
                 _recentResults.Enqueue(result);while(_recentResults.Count>12)_recentResults.TryDequeue(out _);
             }
             if(!ToolCatalog.Queries.Contains(result.Skill)&&!result.Reason.EndsWith("_ack"))RecordActionFeedback(new { kind="task", result=DecisionContextCompression.Receipt(JsonSerializer.SerializeToNode(result)) });
             RecordWorkingResult(result);_triggerKind="task_terminal";
-            _memory.Record(_scope,_session,_day,result.TaskId,result.Status,result.Completed,result.Reason);
+            _memory.Record(_scope,_session,ReceiptExecutionDay(result),result.TaskId,result.Status,result.Completed,result.Reason);
             if(_taskProjects.TryRemove(result.TaskId,out var projectId)&&result.Status is "completed" or "partial")
-                _memory.RecordProjectResult(_scope,projectId,_session,_day,result);
+                _memory.RecordProjectResult(_scope,projectId,_session,ReceiptExecutionDay(result),result);
             Log(new{kind="task",taskId=result.TaskId,status=result.Status,reason=result.Reason,count=result.Completed});
             if(!result.Reason.EndsWith("_ack"))Status=$"{result.Status}：{result.Reason}（实际数量 {result.Completed}）";
             _taskDecisions.TryRemove(result.TaskId,out _);
         }
         else Status=$"{result.Reason}（已完成 {result.Completed}）";
+        if(wakeDecision)WakeDecision(result.ObservationRevision);
         Changed?.Invoke();
     }
-    private void Invalidate(bool cancelPlan=true){Interlocked.Increment(ref _epoch);_request?.Cancel();if(cancelPlan)_planCancellation?.Cancel();}
+    private void Invalidate(bool cancelPlan=true){Interlocked.Increment(ref _epoch);DiscardContinuation();ClearWait();_request?.Cancel();if(cancelPlan)_planCancellation?.Cancel();}
     internal void RecordExternalTask(TaskCommand command)
     {
         var decision="script:"+command.TaskId;_taskDecisions[command.TaskId]=decision;
@@ -145,6 +151,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
     public async Task Resume()
     {
         if(_bridge.Observation is not {} state||!ControlModePolicy.CanControl(state))throw new InvalidOperationException("请先连接联机农场手或明确隔离的单人测试角色");
+        if(!HasPlayerGoal)throw new InvalidOperationException(PlanningBlocker(state));
         _resumed=true;_planningPaused=false;_retryAfter=0;Invalidate();_memory.Set(_scope,"paused","false");
         await _bridge.Control("resume");Status="继续工作；正在观察";_lastDecision=0;WakeDecision();Changed?.Invoke();
         Trace("control",new{action="resume"});
@@ -154,7 +161,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
         _resumed=false;_planningPaused=true;Invalidate();await _bridge.Control("pause");await _bridge.Control("cancel");
         if(_scope!="")
         {
-            _memory.Set(_scope,"paused","true");_memory.Set(_scope,"cancelled","true");_memory.Set(_scope,"player_instructions","[]");
+            _memory.Set(_scope,"paused","true");_memory.Set(_scope,"cancelled","true");
             CancelInputState();
             RetireWorkingBlockers();
             // Explicitly cancelled projects must not return as autonomous objectives after restart.
@@ -224,7 +231,11 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                         if((_thinking==null||_thinking.IsCompleted)&&_messages.TryDequeue(out var offline)&&offline.Scope==_scope)
                             _thinking=AnswerOffline(offline);
                     }
-                    else if(!_bridge.Fresh) { Status="游戏正在加载或状态已过期，等待新观察";Changed?.Invoke(); }
+                    else if(!_bridge.Fresh) { Status="游戏正在加载或状态已过期，等待新观察";Changed?.Invoke();
+                        // A wait must still terminate on its own wall-clock deadline
+                        // even while observations are stale; otherwise it can hang
+                        // with no terminal at all (neither condition nor timeout).
+                        if(_waitDue>0&&Environment.TickCount64>=_waitDue&&_bridge.Observation is {} staleObs){RecordWaitCompletion(staleObs,"timed_out");ClearWait();_triggerKind="wait_timeout";WakeDecision();} }
                     else if(s?.WorldReady==true)
                     {
                         if(AutonomousTrialEndDay is {} end && s.ControlMode=="solo_test" && s.GameDay>=end && s.Menu=="" && s.ActiveTaskId=="")
@@ -232,15 +243,18 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                             if(!_trialFinished){_trialFinished=true;await Pause();Trace("trial_completed",new{gameDay=s.GameDay,targetDays=end,reason="configured_native_days_elapsed",s.TestRunId});}
                             await Task.Delay(200,_lifetime.Token);continue;
                         }
-                        if(_waitFingerprint!=""&&FactFingerprint(s)!=_waitFingerprint){_waitFingerprint="";_waitDue=0;_triggerKind="wait_condition_changed";WakeDecision();}
-                        else if(_waitDue>0&&Environment.TickCount64>=_waitDue){_waitFingerprint="";_waitDue=0;_triggerKind="wait_timeout";WakeDecision();}
+                        if(WaitSatisfied(s)){RecordWaitCompletion(s,"condition_satisfied");ClearWait();_triggerKind="wait_condition_changed";WakeDecision();}
+                        else if(_waitConditionTriggered){_waitConditionTriggered=false;_triggerKind="wait_condition_changed";WakeDecision();}
+                        else if(_waitDue>0&&Environment.TickCount64>=_waitDue){RecordWaitCompletion(s,"timed_out");ClearWait();_triggerKind="wait_timeout";WakeDecision();}
                         if(_retryAfter>0&&Environment.TickCount64>=_retryAfter){_retryAfter=0;if(_triggerKind!="no_action_retry")_triggerKind="model_retry";WakeDecision();}
                         var sleeping=s.Menu is "ReadyCheckDialog" or "SaveGameMenu" or "ShippingMenu";
                         if(PlanningEnabled&&(_thinking==null||_thinking.IsCompleted)&&_planTask is not {IsCompleted:false}&&!sleeping)
                         {
-                            if((_resumed||Mode=="plan_only"&&!_planningPaused)&&_messages.TryDequeue(out var queued))
+                            if(_waitDue==0&&_resumed&&s.ActiveTaskId==""&&SeasonMaintenancePending()&&Environment.TickCount64>=_retryAfter)
+                                _thinking=Think("核验上一日已完成任务并维护季计划进度。",_scope,_session,true);
+                            else if(_waitDue==0&&(_resumed||Mode=="plan_only"&&!_planningPaused)&&_messages.TryDequeue(out var queued))
                             { Interlocked.Exchange(ref _decisionRequested,0);if(queued.Scope==_scope&&queued.Session==_session)_thinking=Think(queued.Text,queued.Scope,queued.Session,queued.SeasonMaintenance); }
-                            else if((_resumed||Mode=="plan_only"&&!_planningPaused)&&s.ActiveTaskId==""&&PendingQuestion==""&&Environment.TickCount64>=_retryAfter&&Environment.TickCount64>=_decisionDue&&s.Revision>=_decisionRevision&&Interlocked.Exchange(ref _decisionRequested,0)==1)
+                            else if(_waitDue==0&&(_resumed||Mode=="plan_only"&&!_planningPaused)&&s.ActiveTaskId==""&&PendingQuestion==""&&Environment.TickCount64>=_retryAfter&&Environment.TickCount64>=_decisionDue&&s.Revision>=_decisionRevision&&Interlocked.Exchange(ref _decisionRequested,0)==1)
                                 _thinking=Think("根据当前工作状态与游戏观察决定下一步。");
                         }
                     }
@@ -286,54 +300,83 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                 "玩家问题："+queued.Text});
             var messages=new JsonArray{new JsonObject{["role"]="system",["content"]=DecisionInstructions.OfflineChat},
                 new JsonObject{["role"]="user",["content"]=prompt}};
+            var requestId=Guid.NewGuid().ToString("N");
             Trace("offline_chat_context",context,decisionId);Trace("model_request",new{kind="offline_chat",model=Settings.Model,toolCount=0},decisionId);
-            var reply=await _model.Complete(Settings,messages,cancellation,toolOverrides:new JsonArray(),maxTokens:512);
-            if(epoch!=Interlocked.Read(ref _epoch)||scope!=_scope||session!=_session)return;
-            Trace("model_reply",new{kind="offline_chat",text=reply.Text,toolCalls=reply.Calls.Count,elapsedMs=reply.ElapsedMs,usage=reply.Usage},decisionId);
+            var reply=await _model.Complete(Settings,messages,cancellation,toolOverrides:new JsonArray(),maxTokens:512,
+                capture:body=>Trace("model_prompt_capture",new{requestId,round=0,kind="offline_chat",prompt=body},decisionId));
+            if(epoch!=Interlocked.Read(ref _epoch)||scope!=_scope||session!=_session){Trace("offline_chat_cancelled",new{reason="context_changed"},decisionId);return;}
+            Trace("model_reply",new{requestId,round=0,kind="offline_chat",text=reply.Text,calls=reply.Calls,toolCalls=reply.Calls.Count,elapsedMs=reply.ElapsedMs,usage=reply.Usage},decisionId);
             if(queued.ConversationMessageId is {Length:>0} messageId)ConfirmConversationMessage(messageId);
             Say(string.IsNullOrWhiteSpace(reply.Text)?"我收到了你的消息。当前没有可用的文字回复，稍后可以再问一次。":reply.Text);
             Status="已回复（游戏未连接；未执行游戏操作）";Changed?.Invoke();
         }catch(OperationCanceledException){Trace("offline_chat_cancelled",new{},decisionId);}
         catch(Exception ex){var error=SafeError(ex);Trace("offline_chat_error",new{error},decisionId);Status="离线聊天失败："+error;Changed?.Invoke();}
-        finally{_request?.Dispose();_request=null;}
+        finally{Trace("decision_finished",new{kind="offline_chat"},decisionId);_request?.Dispose();_request=null;}
     }
     private async Task Think(string instruction,string? expectedScope=null,string? expectedSession=null,bool seasonMaintenance=false)
     {
         var epoch=Interlocked.Read(ref _epoch);var scope=_scope;var session=_session;
+        long continuationFailureVersion;lock(_inputGate)continuationFailureVersion=_continuationFailureVersion;
         if(expectedScope!=null&&(expectedScope!=scope||expectedSession!=session))return;
         var nextProject="";
+        var preparingPlans=false;
+        var waitCompletionSeen=false;
         var decisionId=Guid.NewGuid().ToString("N");
         _request=CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);_request.CancelAfter(TimeSpan.FromSeconds(50));var cancellation=_request.Token;
         _lastDecision=Environment.TickCount64;
         try
         {
             var state=_bridge.Observation!;
+            if(!seasonMaintenance&&PlanningBlocker(state)!=""){
+                preparingPlans=true;
+                await PrepareRequiredPlan(state,cancellation,decisionId,epoch);
+                return;
+            }
             var messages=new JsonArray {new JsonObject{["role"]="system",["content"]=seasonMaintenance?DecisionInstructions.SeasonMaintenance:DecisionInstructions.System}};
             var delivery=AwarenessSnapshot();
             var conversation=ConversationSnapshot();
-            var promptTools=seasonMaintenance?ToolCatalog.SeasonMaintenanceDefinitions():DecisionTools(state);
+            var expandTools=!seasonMaintenance&&Interlocked.Exchange(ref _expandToolsForEpoch,-1)==epoch;
+            var expandOnFollowup=false;
+            GameObservation? observedState=null;
+            GameObservation LatestDecisionObservation()
+            {
+                var live=_bridge.Observation??state;
+                return observedState!=null&&observedState.SessionId==live.SessionId&&observedState.GameDay==live.GameDay&&
+                    observedState.Revision>=live.Revision?observedState:live;
+            }
+            var promptTools=seasonMaintenance?ToolCatalog.SeasonMaintenanceDefinitions():DecisionTools(state,conversation,expandTools);
             var contextSources=new JsonObject{["instruction"]=instruction,["playerGoal"]=PlayerGoal,
                 ["observation"]=new JsonObject{["gameDay"]=state.GameDay,["calendar"]=JsonNode.Parse(state.WorldView)?["decisionFacts"]?["calendar"]?.DeepClone()},
-                ["seasonPlan"]=GetSeasonPlan(),["seasonMaintenance"]=JsonNode.Parse(_memory.Get(scope,"season_maintenance")??"{}")};
+                ["seasonPlan"]=GetSeasonPlan(),["seasonMaintenance"]=JsonNode.Parse(_memory.Get(scope,"season_maintenance")??"{}"),
+                ["waitCompletion"]=_waitCompletion?.DeepClone()};
             var context=seasonMaintenance?contextSources:BuildDecisionInput(state,delivery,conversation,promptTools,instruction);
             Trace("decision_context",context,decisionId);
             messages.Add(new JsonObject{["role"]="user",["content"]=DecisionContextCompression.Serialize(context)});
             for(var round=0;round<3;round++)
             {
-                Trace("model_request",new{round,model=Settings.Model,messageContentCharacters=messages.Sum(m=>m?["content"]?.ToString().Length??0),messageJsonCharacters=messages.ToJsonString(DecisionContextCompression.ReadableJson).Length},decisionId);
-                if(!seasonMaintenance){
-                    promptTools=DecisionTools(_bridge.Observation??state);
-                    context["decisionScope"]=ScopeFor(promptTools);
-                    lock(_inputGate)_lastInput=(JsonObject)context.DeepClone();
-                    messages[1]!["content"]=DecisionContextCompression.Serialize(context);
+                if(!seasonMaintenance&&round>0){
+                    var latest=LatestDecisionObservation();
+                    promptTools=DecisionTools(latest,conversation,expandTools);
+                    if(!JsonNode.DeepEquals(context["decisionScope"],ScopeFor(promptTools))){
+                        var retry=context["trigger"]?["kind"]?.ToString()=="no_action_selected"?context["trigger"]?.DeepClone():null;
+                        context=BuildDecisionInput(latest,delivery,conversation,promptTools,instruction);
+                        if(retry!=null)context["trigger"]=retry;
+                        lock(_inputGate)_lastInput=(JsonObject)context.DeepClone();
+                        messages[1]!["content"]=DecisionContextCompression.Serialize(context);
+                    }
                 }
                 var requestId=Guid.NewGuid().ToString("N");
+                Trace("model_request",new{requestId,round,kind=seasonMaintenance?"sleep_maintenance":"daily_action",model=Settings.Model,
+                    toolCount=promptTools.Count,toolsCharacters=promptTools.ToJsonString(DecisionContextCompression.ReadableJson).Length,
+                    toolsExpanded=expandTools,messageContentCharacters=messages.Sum(m=>m?["content"]?.ToString().Length??0),
+                    messageJsonCharacters=messages.ToJsonString(DecisionContextCompression.ReadableJson).Length},decisionId);
                 var reply=await _model.Complete(Settings,messages,cancellation,soloTest:false,capabilities:state.Capabilities,
                     toolOverrides:promptTools, capture:body=>Trace("model_prompt_capture",new{requestId,round,kind=seasonMaintenance?"sleep_maintenance":"daily_action",gameDay=state.GameDay,
                         prompt=body,feedbackRevision=seasonMaintenance?null:delivery["revision"]?.DeepClone(),eventIds=seasonMaintenance?Array.Empty<string?>():delivery["pendingEvents"]?.AsArray().Select(e=>e?["id"]?.ToString()).ToArray()},decisionId));
                 _retryAfter=0;
                 Log(new{kind="model",elapsedMs=reply.ElapsedMs,usage=reply.Usage});
                 if(epoch!=Interlocked.Read(ref _epoch)||scope!=_scope||session!=_session){Trace("decision_discarded",new{reason="context_changed"},decisionId);return;}
+                if(!seasonMaintenance&&_waitCompletion!=null)waitCompletionSeen=true;
                 if(!seasonMaintenance&&(reply.Text!=""||reply.Calls.Count>0)){ConfirmAwarenessDelivery(delivery);ConfirmConversation(conversation);_triggerKind="state_changed";}
                 Trace("model_reply",new{requestId,round,text=reply.Text,calls=reply.Calls,elapsedMs=reply.ElapsedMs,usage=reply.Usage},decisionId);
                 if(reply.Text!="")Say(reply.Text);
@@ -376,14 +419,13 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                             if(Mode=="plan_only"){_decisionDue=Environment.TickCount64+120000;mutation=true;}
                         }
                         else if(name=="list_capabilities"){
-                            _expandedTools=true;
-                            var expanded=DecisionTools(_bridge.Observation??state);
-                            context=BuildDecisionInput(_bridge.Observation??state,delivery,conversation,expanded,instruction);
-                            messages[1]!["content"]=DecisionContextCompression.Serialize(context);
+                            expandOnFollowup|=!expandTools&&round==2;
+                            expandTools=true;
+                            var expanded=DecisionTools(LatestDecisionObservation(),conversation,expandTools);
                             result=new{status="expanded",scope=ScopeFor(expanded)};
                         }
                         else if(name=="read_context_history"){result=ReadContextHistory(arguments);}
-                        else if(name.StartsWith("group_",StringComparison.Ordinal)||name=="execute_plan")
+                        else if(name.StartsWith("group_",StringComparison.Ordinal))
                         {
                             if(mutation)throw new InvalidOperationException("本轮已经提交计划");
                             var allowed=ScopeFor(promptTools)["allowedSkillsThisTurn"]!.AsArray().Select(v=>v!.ToString()).ToHashSet();
@@ -396,13 +438,7 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                         }
                         else if(name=="wait_for_change")
                         {
-                            var current=_bridge.Observation!;
-                            if(current.Menu!="")throw new InvalidOperationException("modal_menu_blocks_wait:"+current.Menu+":请先使用respond_dialogue或关闭当前界面；菜单打开时游戏时间不会推进");
-                            var seconds=arguments["seconds"]?.GetValue<int>()??30;
-                            if(seconds is <1 or >120)throw new InvalidOperationException("等待必须为1到120秒");
-                            _waitFingerprint=FactFingerprint(current);_waitDue=Environment.TickCount64+seconds*1000;
-                            _expandedTools=false;
-                            result=new{status="waiting",seconds,reason=arguments["reason"]?.GetValue<string>()};mutation=true;
+                            result=StartWait(arguments,_bridge.Observation!);mutation=true;
                         }
                         else if(ToolCatalog.Queries.Contains(name)||BusinessCapabilities.Find(name) is {Query:true})
                         {
@@ -417,14 +453,20 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                         else if(name=="remember_experience") {var id=_memory.Add(scope,"routine",arguments["text"]!.GetValue<string>(),"model_inference",_day);result=new{id,state="unverified"};}
                         else if(name=="update_project")
                         {
-                            var projectId=arguments["projectId"]!.GetValue<string>();var updated=_memory.UpdateProjectNext(scope,projectId,arguments["nextStep"]!.GetValue<string>());
+                            var projectName=arguments["projectName"]!.GetValue<string>();var matches=_memory.Projects(scope).Where(p=>string.Equals(p.Goal,projectName,StringComparison.Ordinal)).ToArray();
+                            if(matches.Length!=1)throw new InvalidOperationException(matches.Length==0?"project_name_not_found":"project_name_ambiguous");
+                            var projectId=matches[0].Id;var updated=_memory.UpdateProjectNext(scope,projectId,arguments["nextStep"]!.GetValue<string>());
                             if(updated)nextProject=projectId;
-                            result=new{updated,state="next_step_only"};
+                            result=new{updated,state=updated?"next_step_only":"not_found",reason=updated?null:"project_not_found"};
                         }
-                        else if(name=="cancel_task") {if(Mode=="plan_only")throw new InvalidOperationException("plan_only");await _bridge.Control("cancel");result=new{status="cancel_requested"};}
+                        else if(name=="cancel_task") {
+                            if(Mode=="plan_only")throw new InvalidOperationException("plan_only");
+                            result=await RequestTaskCancellation(cancellation);
+                        }
                         else if(ToolCatalog.Actions.Contains(name)||BusinessCapabilities.Find(name) is {Query:false})
                         {
                             if(Mode=="plan_only"||!_resumed)throw new InvalidOperationException("Agent 已暂停，不派发动作");
+                            EnsureRequiredPlans(_bridge.Observation!);
                             if(mutation)throw new InvalidOperationException("本轮已派发一项任务；其余动作未执行，请等实际回执后逐项选择");
                             ValidateSkillScope(name,arguments);
                             var latest=_bridge.Observation!;
@@ -433,11 +475,13 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                             if(latest.ActiveTaskId!=""){await _bridge.Control("cancel");await Task.Delay(100,cancellation);}
                             if(epoch!=Interlocked.Read(ref _epoch))return;
                             var taskId=Guid.NewGuid().ToString("N");
+                            BeginAction(taskId,name,authorized,_bridge.Observation??latest);
                             _taskDecisions[taskId]=decisionId;
                             if(nextProject!="")_taskProjects[taskId]=nextProject;
                             Trace("task_dispatch",new{taskId,skill=name,arguments=authorized,source="model"},decisionId);
-                            try { result=await _bridge.Dispatch(name,authorized,cancellation:cancellation,taskId:taskId); }
-                            catch { _taskProjects.TryRemove(taskId,out _);throw; }
+                            try { result=await _bridge.Dispatch(name,authorized,cancellation:cancellation,taskId:taskId);
+                                if(result is TaskResult {Status:"completed" or "partial" or "failed" or "rejected" or "cancelled"} terminal)FinishAction(terminal); }
+                            catch { ForgetAction(taskId);_taskDecisions.TryRemove(taskId,out _);_taskProjects.TryRemove(taskId,out _);throw; }
                             mutation=true;
                         }
                         else throw new InvalidOperationException("模型选择了未注册工具");
@@ -453,25 +497,35 @@ public sealed partial class CompanionRuntime : IAsyncDisposable
                             refreshed.TimeOfDay=observedWorld["decisionFacts"]?["calendar"]?["timeOfDayHHMM"]?.GetValue<int>()??refreshed.TimeOfDay;
                             refreshed.GameDay=observedWorld["observedAt"]?.GetValue<int>()??refreshed.GameDay;
                         }
-                        context=BuildDecisionInput(refreshed,delivery,conversation,DecisionTools(refreshed),instruction);
+                        observedState=refreshed;
+                        context=BuildDecisionInput(refreshed,delivery,conversation,DecisionTools(refreshed,conversation,expandTools),instruction);
                         messages[1]!["content"]=DecisionContextCompression.Serialize(context);
                         modelResult=new{status=observed.Status,reason=observed.Reason,observationRevision=observed.ObservationRevision,observationUpdated=true,reference="world"};
                     }
                     messages.Add(new JsonObject{["role"]="tool",["tool_call_id"]=call!["id"]!.GetValue<string>(),["content"]=DecisionContextCompression.Serialize(modelResult)});
+                    if(!seasonMaintenance&&mutation&&Mode!="plan_only"&&_resumed
+                        &&(name.StartsWith("group_",StringComparison.Ordinal)||ToolCatalog.Actions.Contains(name)||BusinessCapabilities.Find(name) is {Query:false})
+                        &&(result is TaskResult {Status:"accepted" or "completed"}
+                            ||JsonSerializer.SerializeToNode(result)?["status"]?.ToString() is "accepted" or "completed"))
+                        await PlanContinuation(context,name,new{arguments,result},decisionId,epoch,continuationFailureVersion,cancellation);
                     if(mutation||PendingQuestion!="")break;
                 }
                 if(mutation){_emptyDecisionRetries=0;break;}
                 if(round==2&&reply.Calls.Count>0&&PendingQuestion==""&&_waitDue==0&&_bridge.Observation?.ActiveTaskId==""&&_planTask is not {IsCompleted:false}){
+                    if(expandOnFollowup)Interlocked.Exchange(ref _expandToolsForEpoch,epoch);
                     _triggerKind="tool_followup";WakeDecision(_bridge.Observation?.Revision??state.Revision);
                 }
             }
         }
         catch(OperationCanceledException){Trace("decision_cancelled",new{reason=epoch==Interlocked.Read(ref _epoch)?"timeout":"context_changed"},decisionId);if(epoch==Interlocked.Read(ref _epoch)){Status="模型请求超时；当前本地任务继续";_retryAfter=Environment.TickCount64+60000;Changed?.Invoke();}}
-        catch(Exception ex){Status="模型暂不可用，60秒后自动重试："+SafeError(ex);_retryAfter=Environment.TickCount64+60000;Log(new{kind="model_error",error=ex.GetType().Name});Trace("model_error",new{error=SafeError(ex)},decisionId);Changed?.Invoke();}
+        catch(Exception ex){Status=(preparingPlans?"必需计划未生成完成，禁止执行动作；60秒后重试：":"模型暂不可用，60秒后自动重试：")+SafeError(ex);_retryAfter=Environment.TickCount64+60000;Log(new{kind="model_error",error=ex.GetType().Name});Trace("model_error",new{error=SafeError(ex)},decisionId);Changed?.Invoke();}
         finally{
+            if(waitCompletionSeen&&!seasonMaintenance)_waitCompletion=null;
             if(_planTask is not {IsCompleted:false}&&Environment.TickCount64>=_decisionDue)_decisionDue=Environment.TickCount64+1000;
             if(seasonMaintenance&&epoch==Interlocked.Read(ref _epoch)&&scope==_scope&&session==_session&&_resumed&&_retryAfter==0){
-                _triggerKind="season_maintenance_completed";WakeDecision(_bridge.Observation?.Revision??0);
+                if(SeasonMaintenancePending()){
+                    _retryAfter=Environment.TickCount64+5000;_triggerKind="season_maintenance_retry";
+                }else {_triggerKind="season_maintenance_completed";WakeDecision(_bridge.Observation?.Revision??0);}
             }
             else if(!seasonMaintenance&&epoch==Interlocked.Read(ref _epoch)&&_resumed&&PendingQuestion==""&&_waitDue==0&&_retryAfter==0
                 &&_bridge.Observation?.ActiveTaskId==""&&_planTask is not {IsCompleted:false}&&Volatile.Read(ref _decisionRequested)==0){

@@ -28,16 +28,20 @@ internal sealed class RoutineExecutor
     private readonly string _encounterPolicy;
     private readonly List<object> _storageTransfers=new();
     private readonly List<object> _routeDropResults=new();
+    private readonly List<object> _navigationResults=new();
+    private readonly HashSet<object> _capturedNavigationEffects=new();
+    private NavigationTargets.Target? _namedTarget;
     private readonly HashSet<Debris> _visitedRouteDrops=new();
     private readonly Dictionary<string,int> _routeItemGains=new();
     private Debris? _activeRouteDrop;
     private long _activeRouteDropWait;
     private long _activeRouteDropDeadline;
     private int _uncollectedRouteDrops;
-    internal object? BusinessDetails=>_business==null&&_activity==null&&_encounterResults.Count==0&&_storageTransfers.Count==0&&_routeDropResults.Count==0?null:new{stages=_business?.Stages.AsEnumerable()??Array.Empty<object>(),activity=_activity?.Details,encounters=_encounterResults.ToArray(),skipped=_business?.Skipped.AsEnumerable()??Array.Empty<object>(),storageTransfers=_storageTransfers.ToArray(),routeDrops=_routeDropResults.ToArray()};
+    internal object? BusinessDetails=>_business==null&&_activity==null&&_encounterResults.Count==0&&_storageTransfers.Count==0&&_routeDropResults.Count==0&&_navigationResults.Count==0?null:new{stages=_business?.Stages.AsEnumerable()??Array.Empty<object>(),activeStage=_business?.ActiveStage,outcome=_business?.Outcome,activity=_activity?.Details,encounters=_encounterResults.ToArray(),skipped=_business?.Skipped.AsEnumerable()??Array.Empty<object>(),storageTransfers=_storageTransfers.ToArray(),routeDrops=_routeDropResults.ToArray(),navigation=_navigationResults.ToArray()};
     private readonly string _skill;
     private readonly JsonElement _args;
     private readonly Action<GridPoint> _interact;
+    private readonly ExecutionClock _clock=new();
     private readonly Navigation _nav = new();
     private readonly HashSet<GridPoint> _done = new();
     private GridPoint? _target;
@@ -61,7 +65,7 @@ internal sealed class RoutineExecutor
     private readonly Dictionary<string,int> _collectedItems=new();
     internal Dictionary<string,int> CollectedItems=>_business?.CollectedItems??_areaAction?.CollectedItems??_collectedItems;
     internal object[] AffectedTiles=>_business?.AffectedTiles??_areaAction?.AffectedTiles??_done.Select(p=>(object)new{x=p.X,y=p.Y}).ToArray();
-    internal object[] RemainingDrops()=>!StardewModdingAPI.Context.IsWorldReady||!_acted||_skill is not ("harvest_area" or "forage_area")?Array.Empty<object>():PendingDrops().Select(d=>(object)new{
+    internal object[] RemainingDrops()=>_business!=null?_business.RemainingDrops():_areaAction!=null?_areaAction.RemainingDrops():!StardewModdingAPI.Context.IsWorldReady||!_acted||_skill is not ("harvest_area" or "forage_area")?Array.Empty<object>():PendingDrops().Select(d=>(object)new{
         id=d.item?.QualifiedItemId??d.itemId.Value,type=d.debrisType.Value.ToString(),
         chunks=d.Chunks.Select(c=>new{x=c.position.X,y=c.position.Y}).ToArray()}).ToArray();
     private readonly List<GridPoint> _actionTargets = new();
@@ -84,7 +88,7 @@ internal sealed class RoutineExecutor
         if (skill is "deposit_items" or "withdraw_items")
         { Text("chestId"); Text("itemId"); if (Number("count", 0) is < 1 or > 9999) throw new JsonException("Invalid item count"); }
         if (skill == "follow_player" && !long.TryParse(Text("playerId"), out _)) throw new JsonException("Invalid player identity");
-        if (skill == "go_to") { Text("location"); Number("x"); Number("y"); }
+        if (skill == "go_to") ContractValidation.ValidateNavigation(_args);
         if(skill=="go_to"&&Flag("collect")&&(Number("pickupRadius",2) is <0 or >8))throw new JsonException("Invalid pickup radius");
         if(skill=="go_to"&&Flag("collect"))_inventoryBefore=InventorySnapshot();
         if (skill.EndsWith("_area"))
@@ -96,9 +100,16 @@ internal sealed class RoutineExecutor
     private bool InArea(GridPoint p) => p.X >= Number("x") && p.Y >= Number("y") && p.X < Number("x") + Number("width", 1) && p.Y < Number("y") + Number("height", 1);
     private bool Flag(string key)=>_args.TryGetProperty(key,out var v)&&v.ValueKind==JsonValueKind.True;
     private string End(string reason) { Reason = reason; return Completed > 0 ? "partial" : "failed"; }
+    internal bool HandlesStoryDialogue=>_skill=="respond_dialogue"||_business?.HandlesStoryDialogue==true;
+    internal void SuspendForStoryPrompt()
+    {
+        _clock.Pause();_nav.Suspend();_business?.SuspendForStoryPrompt();
+        _areaAction?.SuspendForStoryPrompt();_activity?.SuspendForStoryPrompt();_encounterActivity?.SuspendForStoryPrompt();
+    }
     internal string Tick(AiInputSimulator input)
     {
-        var now = Environment.TickCount64;
+        _clock.Resume();
+        var now = _clock.Now;
         if(_skill=="respond_dialogue")return RespondDialogue(now);
         var sleeping=_skill=="sleep"||_skill=="end_day"&&Flag("sleep")||_skill=="recover"&&Text("method")=="sleep";
         if(sleeping&&Game1.activeClickableMenu is ShippingMenu shipping){
@@ -114,7 +125,7 @@ internal sealed class RoutineExecutor
         if(Game1.Date.TotalDays!=_day){
             if(sleeping){
                 if(Game1.activeClickableMenu!=null||!Game1.player.CanMove||Game1.endOfNightMenus.Count>0){Phase="waiting_for_native_save";return "running";}
-                Reason="new_day_observed";return "completed";
+                _business?.MarkDayCompleted();Reason="new_day_observed";return "completed";
             }
             return End("native_day_changed_replan_required:原版已换日，请根据新状态决定后续工作");
         }
@@ -164,7 +175,12 @@ internal sealed class RoutineExecutor
         {
             Phase = "travel_to_area";
             var state = _nav.Move(Map, new(Number("x", 0), Number("y", 0)), input, _interact);
-            return state is "blocked" or "unsupported" ? End(_nav.Reason) : "running";
+            if(state is "blocked" or "unsupported"){
+                _navigationResults.Add(new{status=state,reason=_nav.Reason,fromMap=Game1.currentLocation.NameOrUniqueName,destination=Map,
+                    target=new{x=Number("x",0),y=Number("y",0)},observedExits=Navigation.Edges().Where(e=>e.From==Game1.currentLocation.NameOrUniqueName).ToArray()});
+                return End(_nav.Reason);
+            }
+            return "running";
         }
         if (_acted)
         {
@@ -204,7 +220,11 @@ internal sealed class RoutineExecutor
             _nextTargetScan = now + 250;
             // Re-read actual world every batch. No model call at a 16-target boundary.
             var batch = Targets().Where(p => !_done.Contains(p)).OrderBy(p => p.Distance(Navigation.Current)).Take(16).ToArray();
-            if (batch.Length == 0) { Reason = "observed_targets_finished"; return "completed"; }
+            if (batch.Length == 0)
+            {
+                if(Completed==0&&_skill=="water_area")return End("no_waterable_crops_in_requested_area");
+                Reason = "observed_targets_finished"; return "completed";
+            }
             _target = batch[0]; _approach = _nav.BestAdjacent(_target.Value);
             if (_approach == null) return End("target_unreachable");
         }
@@ -267,35 +287,61 @@ internal sealed class RoutineExecutor
         {
             var player = Game1.getOnlineFarmers().FirstOrDefault(f => f.UniqueMultiplayerID.ToString() == Text("playerId"));
             if (player?.currentLocation == null) return End("player_unavailable");
-            if (!WorldView.Supported(player.currentLocation)) { Phase = "waiting_at_supported_boundary"; return "running"; }
+            if (!WorldView.Supported(player.currentLocation)||!ExecutionTargets.AllowedLocation(player.currentLocation.NameOrUniqueName)) { Phase = "waiting_at_supported_boundary"; return "running"; }
             map = player.currentLocation.NameOrUniqueName; goal = new(player.TilePoint.X, player.TilePoint.Y);
             if (map == Game1.currentLocation.NameOrUniqueName && Navigation.Current.Distance(goal) <= 2) { Phase = "following_wait"; return "running"; }
             if (map == Game1.currentLocation.NameOrUniqueName) goal = _nav.BestAdjacent(goal) ?? goal;
         }
+        else if(_args.TryGetProperty("name",out _)||!_args.TryGetProperty("x",out _)){
+            if(_namedTarget==null){
+                _namedTarget=NavigationTargets.Resolve(_args,out var failure);
+                if(_namedTarget==null){_navigationResults.Add(failure!);return End(JsonSerializer.SerializeToElement(failure).GetProperty("reason").GetString()!);}
+                _navigationResults.Add(new{state="resolved",target=_namedTarget});
+            }
+            if(_namedTarget.Kind=="npc"){
+                var observed=NavigationTargets.RefreshNpc(_namedTarget);
+                if(observed==null){_navigationResults.Add(new{reason="named_npc_not_present_in_world",lastResolved=_namedTarget});return End("named_npc_not_present_in_world");}
+                _namedTarget=observed;
+            }
+            map=_namedTarget.Location;
+            if(!ExecutionTargets.AllowedLocation(map))return End("location_disabled:"+map);
+            goal=_namedTarget.Tile??Navigation.Current;
+            if(map==Game1.currentLocation.NameOrUniqueName&&_namedTarget.Tile.HasValue){
+                if(_namedTarget.Kind=="chest"&&(!Game1.currentLocation.objects.TryGetValue(new(goal.X,goal.Y),out var chest)
+                    ||chest is not Chest||!chest.modData.TryGetValue(WorldView.ChestKey,out var chestId)||chestId!=_namedTarget.Id))
+                    return End("named_chest_binding_invalid");
+                var adjacent=_nav.BestAdjacent(goal);if(adjacent==null)return End("named_target_unreachable");goal=adjacent.Value;
+            }
+        }
         else { map = Text("location"); goal = new(Number("x"), Number("y")); }
         if(_skill=="go_to"&&Flag("collect"))
         {
-            var collection=CollectAlongRoute(map,input);
+            var collection=CollectAlongRoute(map,goal,input);
             if(collection!=null)return collection;
         }
         Phase = "walking";
         var state = _nav.Move(map, goal, input, _interact, _skill=="go_to"&&Flag("breakNaturalObstacles"));
-        if (state is "blocked" or "unsupported") return End(_nav.Reason);
+        if(state is "blocked" or "unsupported"){CaptureNavigationEffects();return End(_nav.Reason);}
         if (state != "reached" || _skill == "follow_player") return "running";
+        CaptureNavigationEffects();
+        if(_namedTarget!=null)_navigationResults.Add(new{state="arrived",target=_namedTarget,playerTile=Navigation.Current,interacted=false});
         if (_skill == "sleep") { Phase = "enter_bed"; input.Direction = "right"; return "running"; }
         if(_skill=="go_to"&&Flag("collect")&&_uncollectedRouteDrops>0)
         {Reason="destination_reached_with_uncollected_route_drops";return "completed";}
         Reason = "destination_observed"; return "completed";
     }
-    private string? CollectAlongRoute(string destination,AiInputSimulator input)
+    private void CaptureNavigationEffects(){
+        foreach(var item in _nav.BrokenObstacles)if(_capturedNavigationEffects.Add(item))_navigationResults.Add(new{state="obstacle_cleared_during_navigation",effect=item});
+    }
+    private string? CollectAlongRoute(string destination,GridPoint destinationTile,AiInputSimulator input)
     {
         var location=Game1.currentLocation;CaptureRouteItems();GridPoint segmentGoal;
-        try{segmentGoal=location.NameOrUniqueName==destination?new GridPoint(Number("x"),Number("y")):_nav.SegmentGoal(destination);}catch(InvalidOperationException){return null;}
+        try{segmentGoal=location.NameOrUniqueName==destination?destinationTile:_nav.SegmentGoal(destination);}catch(InvalidOperationException){return null;}
         var breakObstacles=Flag("breakNaturalObstacles");var path=_nav.PreviewPath(segmentGoal,breakObstacles);
         if(path==null)return null;
         if(_activeRouteDrop!=null)
         {
-            if(Environment.TickCount64>=_activeRouteDropDeadline){
+            if(_clock.Now>=_activeRouteDropDeadline){
                 _visitedRouteDrops.Add(_activeRouteDrop);_routeDropResults.Add(new{state="skipped",reason="pickup_timeout_or_inventory_full",itemId=_activeRouteDrop.item?.QualifiedItemId??_activeRouteDrop.itemId.Value});
                 _uncollectedRouteDrops++;_activeRouteDrop=null;_nav.Reset();return "running";
             }
@@ -324,8 +370,8 @@ internal sealed class RoutineExecutor
             if(move=="reached")
             {
                 Phase="pickup_route_drop";
-                if(_activeRouteDropWait==0)_activeRouteDropWait=Environment.TickCount64+1200;
-                else if(Environment.TickCount64>=_activeRouteDropWait){CaptureRouteItems();_activeRouteDropWait=Environment.TickCount64+250;}
+                if(_activeRouteDropWait==0)_activeRouteDropWait=_clock.Now+1200;
+                else if(_clock.Now>=_activeRouteDropWait){CaptureRouteItems();_activeRouteDropWait=_clock.Now+250;}
             }
             return "running";
         }
@@ -335,7 +381,7 @@ internal sealed class RoutineExecutor
             .Where(d=>d.tiles.Any(tile=>path.Min(p=>DistanceSquared(p,tile))<=radius*radius))
             .OrderBy(d=>d.tiles.Min(tile=>Navigation.Current.Distance(tile))).FirstOrDefault();
         if(candidate==null)return null;
-        _activeRouteDrop=candidate.drop;_activeRouteDropWait=0;_activeRouteDropDeadline=Environment.TickCount64+15000;_nav.Reset();
+        _activeRouteDrop=candidate.drop;_activeRouteDropWait=0;_activeRouteDropDeadline=_clock.Now+15000;_nav.Reset();
         return "running";
     }
     private static int DistanceSquared(GridPoint a,GridPoint b)
@@ -386,8 +432,9 @@ internal sealed class RoutineExecutor
         && d.Chunks.Any(c=>_actionTargets.Any(t=>Vector2.DistanceSquared(c.position.Value,new Vector2(t.X*64,t.Y*64))<=256*256))).ToArray();
     internal void CaptureCompleted()
     {
-        if(_business!=null){_business.Capture();return;}
-        if(_areaAction!=null){_areaAction.Capture();return;}
+        CaptureNavigationEffects();
+        if(_business!=null){_business.Capture();Completed=_business.Completed;return;}
+        if(_areaAction!=null){_areaAction.Capture();Completed=_areaAction.Completed;return;}
         if(!StardewModdingAPI.Context.IsWorldReady||!_acted||_target==null||Game1.currentLocation.NameOrUniqueName!=Map||!Satisfied(_target.Value))return;
         if(_skill=="water_area") { if(!_actionVerified&&GetSoil(_target.Value)?.state.Value==1){Completed++;_actionVerified=true;_done.Add(_target.Value);}return; }
         if(_skill is not ("harvest_area" or "forage_area"))return;
@@ -422,7 +469,7 @@ internal sealed class RoutineExecutor
         if (can == null) return End("watering_can_missing");
         if (_refillWait != 0)
         {
-            if (Environment.TickCount64 < _refillWait) return "running";
+            if (_clock.Now < _refillWait) return "running";
             if (can.WaterLeft <= _before) return End("refill_not_verified");
             if(continueWater&&can.WaterLeft<40){_refillWait=0;return "running";}
             _refillTarget = null; _refillWait = 0; _nav.Reset();
@@ -445,7 +492,7 @@ internal sealed class RoutineExecutor
         if (move == "reached")
         {
             Face(_refillTarget.Value); Game1.player.CurrentToolIndex = Game1.player.Items.IndexOf(can);
-            _before = can.WaterLeft; input.Tool = true; _refillWait = Environment.TickCount64 + 1000;
+            _before = can.WaterLeft; input.Tool = true; _refillWait = _clock.Now + 1000;
         }
         return "running";
     }
@@ -465,12 +512,12 @@ internal sealed class RoutineExecutor
         {
             if (_waitUntil == 0)
             {
-                _waitUntil=Environment.TickCount64+3000;_ownedChest=chest;
+                _waitUntil=_clock.Now+3000;_ownedChest=chest;
                 // Guard a delayed native mutex callback so cancellation cannot open a new menu later.
                 chest.GetMutex().RequestLock(()=>{if(_disposed)chest.GetMutex().ReleaseLock();else _interact(tile);},()=>_lockFailed=true);
             }
             else if(_lockFailed)return End("chest_busy_or_open_failed");
-            else if (Environment.TickCount64 > _waitUntil) return End("chest_busy_or_open_failed");
+            else if (_clock.Now > _waitUntil) return End("chest_busy_or_open_failed");
         }
         Phase = "open_authorized_chest"; return "running";
     }
@@ -478,18 +525,22 @@ internal sealed class RoutineExecutor
     {
         if (menu.sourceItem is not Chest chest || !ReferenceEquals(chest,_ownedChest) || !WorldView.WorkChest(chest) || !chest.GetMutex().IsLockHeld() || !chest.modData.TryGetValue(WorldView.ChestKey, out var id) || id != Text("chestId")) return End("unexpected_container");
         var itemId = Text("itemId");
-        if (!_args.TryGetProperty("allowedIds", out var allowed) || !allowed.EnumerateArray().Any(v => v.GetString() == itemId)) return End("item_not_authorized");
+        if (!_args.TryGetProperty("allowedIds", out var allowed) || !allowed.EnumerateArray().Any(v => v.GetString() == itemId)) {Reason="item_not_authorized";return "rejected";}
         var source = _skill == "deposit_items" ? menu.inventory.actualInventory : menu.ItemsToGrabMenu.actualInventory;
         var destination = _skill == "deposit_items" ? menu.ItemsToGrabMenu.actualInventory : Game1.player.Items;
         if (Completed >= Number("count")) { menu.receiveKeyPress(Keys.Escape); Reason = "transfer_verified"; return "completed"; }
         var quality = _args.TryGetProperty("quality", out var q) ? q.GetInt32() : -1;
         var transferred = 0;
         var eligibleSourceFound = false;
+        var matchingSourceFound=false;var protectedSourceFound=false;var qualityMismatchFound=false;
         var remaining = Number("count") - Completed;
         foreach (var pair in source.Select((item, index) => (item, index)).ToArray())
         {
             var item = pair.item;
-            if (item == null || item.QualifiedItemId != itemId || item is Tool || item.modData.ContainsKey("StardewCompanion/Protected") || (quality >= 0 && item.Quality != quality)) continue;
+            if (item == null || item.QualifiedItemId != itemId) continue;
+            matchingSourceFound=true;
+            if(item is Tool||item.modData.ContainsKey("StardewCompanion/Protected")){protectedSourceFound=true;continue;}
+            if(quality>=0&&item.Quality!=quality){qualityMismatchFound=true;continue;}
             if (item.IsRecipe || item.QualifiedItemId is "(O)434" or "(O)326") { menu.receiveKeyPress(Keys.Escape); return End("item_has_consumption_side_effect"); }
             eligibleSourceFound = true;
             var amount = Math.Min(remaining, item.Stack);
@@ -505,9 +556,17 @@ internal sealed class RoutineExecutor
         if (transferred == 0)
         {
             menu.receiveKeyPress(Keys.Escape);
-            return End(!eligibleSourceFound?"source_empty_or_protected_or_quality_mismatch":_skill=="withdraw_items"?"inventory_full":"chest_full");
+            var left=Math.Max(0,Number("count")-Completed);
+            _storageTransfers.Add(new{direction=_skill=="deposit_items"?"to_chest":"from_chest",itemId,quality=quality<0?(int?)null:quality,
+                requested=Number("count"),transferred=0,remaining=left,chestId=id,matchingSourceFound,protectedSourceFound,qualityMismatchFound});
+            var reason=eligibleSourceFound?(_skill=="withdraw_items"?"inventory_full":"chest_full")
+                :Completed>0?"source_shortage":!matchingSourceFound?"source_item_not_found":protectedSourceFound&&!qualityMismatchFound?"source_item_protected":
+                    qualityMismatchFound?"source_quality_mismatch":"source_item_unavailable";
+            return End(reason);
         }
-        _storageTransfers.Add(new{direction=_skill=="deposit_items"?"to_chest":"from_chest",itemId,quality=quality<0?(int?)null:quality,count=transferred,chestId=id});
+        var remainingAfter=Math.Max(0,Number("count")-Completed-transferred);
+        _storageTransfers.Add(new{direction=_skill=="deposit_items"?"to_chest":"from_chest",itemId,quality=quality<0?(int?)null:quality,
+            requested=Number("count"),count=transferred,transferred,remaining=remainingAfter,chestId=id});
         Completed += transferred;
         Phase = "transfer_items";
         if(Completed>=Number("count")){Reason="transfer_verified";return "completed";}return "running";
@@ -543,6 +602,7 @@ internal sealed class RoutineExecutor
     internal bool Cleanup()
     {
         _disposed=true;
+        _activity?.Cleanup();
         SpecialActivityExecutor.ClearActiveFishing();
         if(!StardewModdingAPI.Context.IsWorldReady)return true;
         if(_business?.Cleanup()==false)return false;
@@ -560,6 +620,6 @@ internal sealed class RoutineExecutor
         if(_ownedChest.GetMutex().IsLockHeld())_ownedChest.GetMutex().ReleaseLock();
         return true;
     }
-    internal bool ProgressDue => Environment.TickCount64 - _lastProgress > 1000;
-    internal void ProgressSent() => _lastProgress = Environment.TickCount64;
+    internal bool ProgressDue => _clock.Now - _lastProgress > 1000;
+    internal void ProgressSent() => _lastProgress = _clock.Now;
 }

@@ -14,7 +14,7 @@ internal static class SeasonToolChecks
             var bridge=new SeasonBridge();var model=new SeasonModel(scenario);
             var settings=new ModelSettings{Endpoint="http://127.0.0.1:1/chat/completions",Model="season-check"};settings.SetKey("not-real");
             await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(scenarioFolder,"memory.db")),settings,new HttpClient(model),Path.Combine(scenarioFolder,"events.jsonl"));
-            bridge.Publish();await runtime.Resume();bridge.Observation!.GameDay++;bridge.Publish();runtime.Start();
+            bridge.Publish();await runtime.UpdateGoal(new PlayerGoalUpdate{Objective="季节维护测试目标",ReplaceObjective=true});await runtime.Resume();bridge.Observation!.GameDay++;bridge.Publish();runtime.Start();
             var deadline=Environment.TickCount64+5000;
             while(!runtime.Decisions.Read().Any(e=>e.Kind=="decision_finished")&&Environment.TickCount64<deadline)await Task.Delay(10);
             await runtime.Pause();

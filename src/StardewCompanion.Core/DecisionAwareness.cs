@@ -18,6 +18,13 @@ public sealed partial class CompanionRuntime
             ["pendingEvents"]=new JsonArray(),["deliveredEvents"]=new JsonArray(),["seenEventIds"]=new JsonArray()};
     }
     private void SaveAwareness()=>_memory.Set(_scope,"decision_awareness",_awareness.ToJsonString());
+    private bool HasTerminalTaskResult(string taskId)
+    {
+        if(_recentResults.Any(r=>r.TaskId==taskId))return true;
+        var latest=_awareness["actionFeedback"]?["latest"];
+        return DecisionContextCompression.Text(latest?["result"],"taskId")==taskId
+            ||DecisionContextCompression.Text(latest,"taskId")==taskId;
+    }
     private void RetireWorkingBlockers()
     {
         lock(_awarenessGate){LoadAwareness();
@@ -29,6 +36,19 @@ public sealed partial class CompanionRuntime
     public JsonObject AwarenessSnapshot()
     {
         lock(_awarenessGate){LoadAwareness();var copy=(JsonObject)_awareness.DeepClone();copy.Remove("seenEventIds");
+            var resolved=(_awareness["pendingEvents"] as JsonArray??new()).Concat(_awareness["deliveredEvents"] as JsonArray??new())
+                .Where(e=>e?["type"]?.ToString()=="story_prompt_resolved").Select(e=>e?["facts"]?["promptId"]?.ToString()).Where(id=>!string.IsNullOrEmpty(id)).ToHashSet();
+            if(copy["pendingEvents"] is JsonArray events)foreach(var e in events.ToArray()){
+                var facts=e?["facts"] as JsonObject;
+                var taskId=facts?["activeTaskId"]?.ToString();
+                if(!string.IsNullOrEmpty(taskId)&&!HasTerminalTaskResult(taskId)&&facts?["handling"]?.ToString()!="await_model_choice"){events.Remove(e);continue;}
+                if(e?["type"]?.ToString()=="story_prompt"&&facts?["handling"]?.ToString()=="script_acknowledgement"){
+                    var promptId=facts["promptId"]?.ToString();
+                    var legacyClosed=string.IsNullOrEmpty(promptId)&&_bridge.Observation?.Menu!="DialogueBox";
+                    if(!legacyClosed&&!resolved.Contains(promptId)){events.Remove(e);continue;}
+                    facts["resolved"]=true;facts["requiresResponse"]=false;
+                }
+            }
             if(copy["actionFeedback"]?["blockers"] is JsonArray blockers)foreach(var b in blockers.OfType<JsonObject>())b.Remove("stateKey");return copy;}
     }
     private static string StateKey(GameObservation? state)
@@ -54,9 +74,9 @@ public sealed partial class CompanionRuntime
             var status=DecisionContextCompression.Text(node,"status");
             if(status=="")status=DecisionContextCompression.Text(receiptNode,"status");
             if(status is "failed" or "partial" or "rejected" or "stopped" or "duplicate_not_executed"){
-                var target=DecisionContextCompression.Get(receiptNode,"requestedTarget")??(node["unexecuted"] as JsonArray)?.FirstOrDefault()?["Arguments"];
+                var target=DecisionContextCompression.Get(receiptNode,"requestedTarget")??node["arguments"]??(node["unexecuted"] as JsonArray)?.FirstOrDefault()?["Arguments"];
                 var skill=DecisionContextCompression.Text(receiptNode,"skill");
-                if(skill=="")skill=(node["unexecuted"] as JsonArray)?.FirstOrDefault()?["Skill"]?.ToString()??"";
+                if(skill=="")skill=node["tool"]?.ToString()??(node["unexecuted"] as JsonArray)?.FirstOrDefault()?["Skill"]?.ToString()??"";
                 if(reason.StartsWith("unchanged_target_previously_failed")&&node["originalFailure"] is {} original)reason=original.ToString();
                 var key=skill+":"+target?.ToJsonString()+":"+(reason.Contains("inventory_full")?"inventory_full":reason);
                 var blockers=feedback["blockers"]!.AsArray();
@@ -68,7 +88,7 @@ public sealed partial class CompanionRuntime
                 }
                 else blockers.Add(new JsonObject{["key"]=key,["reason"]=reason,["skill"]=skill,["target"]=target?.DeepClone(),
                     ["blockedDay"]=_day,["evidence"]=DecisionContextCompression.Get(receiptNode,"businessDetails")?.DeepClone(),
-                    ["taskId"]=DecisionContextCompression.Text(receiptNode,"taskId"),["count"]=1,["location"]=_bridge.Observation?.Location,["stateKey"]=StateKey(_bridge.Observation),
+                    ["taskId"]=DecisionContextCompression.Text(receiptNode,"taskId"),["count"]=1,["location"]=_bridge.Observation?.Location,["stateKey"]=StateKey(_bridge.Observation),["shopAccess"]=ShopAccess(_bridge.Observation),
                     ["meaning"]=reason.Contains("inventory_full")?"目标物品未能采入背包；先释放容量，计划未执行步骤仍未完成":"本次动作未完全成功；检查原始原因及未执行步骤"});
             }
             _awareness["revision"]=_awareness["revision"]!.GetValue<long>()+1;SaveAwareness();
@@ -78,13 +98,18 @@ public sealed partial class CompanionRuntime
     {
         string[] ack;
         lock(_awarenessGate){
-            LoadAwareness();var changed=false;
+            LoadAwareness();var changed=false;var deferForTaskCompletion=false;
             var w=JsonNode.Parse(state.WorldView) as JsonObject??new();
             var events=w["gameEvents"] as JsonArray??new();
             var seen=_awareness["seenEventIds"]!.AsArray();var known=seen.Select(e=>e!.ToString()).ToHashSet();
             ack=events.Select(e=>e?["id"]?.ToString()??"").Where(id=>id!="").ToArray();
             foreach(var e in events){var id=e?["id"]?.ToString();if(id==null||!known.Add(id))continue;
-                seen.Add(id);_awareness["pendingEvents"]!.AsArray().Add(e!.DeepClone());changed=true;Trace("game_event_received",e!);}
+                seen.Add(id);_awareness["pendingEvents"]!.AsArray().Add(e!.DeepClone());changed=true;Trace("game_event_received",e!);
+                var type=e?["type"]?.ToString();
+                var activeTaskId=type is "story_prompt" or "story_prompt_resolved" or "mail_arrived"?e?["facts"]?["activeTaskId"]?.ToString():null;
+                if(!string.IsNullOrWhiteSpace(activeTaskId)&&!HasTerminalTaskResult(activeTaskId))deferForTaskCompletion=true;
+                if(type=="story_prompt"&&e?["facts"]?["handling"]?.ToString()=="script_acknowledgement")deferForTaskCompletion=true;
+            }
             var blockers=_awareness["actionFeedback"]!["blockers"]!.AsArray();
             foreach(var b in blockers.OfType<JsonObject>().ToArray()){
                 var inventoryFailure=b["reason"]!.ToString().Contains("inventory_full");
@@ -100,11 +125,11 @@ public sealed partial class CompanionRuntime
                             resolved|=targets.Length==0||targets.All(f=>f?["canAccept"]?.GetValue<bool>()==true);
                         }
                     }
-                }else if(b["reason"]?.ToString()=="shop_closed_for_day")resolved=b["blockedDay"]?.GetValue<int>()!=state.GameDay;
+                }else if(IsShopDayClosure(b["reason"]?.ToString()))resolved=b["blockedDay"]?.GetValue<int>()!=state.GameDay||!JsonNode.DeepEquals(b["shopAccess"],ShopAccess(state));
                 else resolved=b["stateKey"]?.ToString()!=StateKey(state);
                 if(resolved){blockers.Remove(b);changed=true;Trace("blocker_resolved",b);}
             }
-            if(changed){_triggerKind="important_event";_awareness["revision"]=_awareness["revision"]!.GetValue<long>()+1;SaveAwareness();WakeDecision();}
+            if(changed){_triggerKind="important_event";_awareness["revision"]=_awareness["revision"]!.GetValue<long>()+1;SaveAwareness();if(!deferForTaskCompletion)WakeDecision();}
         }
         // Ack intake only after durable storage; delivery to the LLM is tracked separately.
         if(ack.Length>0)_=_bridge.AcknowledgeEvents(ack);

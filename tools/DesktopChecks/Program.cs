@@ -21,6 +21,7 @@ internal static class Program
             {
                 // Never interrupt another running Companion instance.
                 using (var probe = new TcpListener(IPAddress.Loopback, 27841)) probe.Start();
+                InteractionChecks.Run(Path.Combine(folder,"interaction"));
                 await RecoverAndRetry(Path.Combine(folder, "recovery"));
                 Console.WriteLine("PASS desktop recovers settings, retries startup, saves safely and releases its port");
                 await SaveAfterStartupFailure(Path.Combine(folder, "save-retry"));
@@ -61,9 +62,10 @@ internal static class Program
             Click(window, "重试启动本地服务");
             await Wait(() => Text(window, "服务已就绪"), "retry did not start the service");
             Require(await Healthy(data), "retried service was not reachable");
+            Require(Descendants(window).OfType<Button>().Any(b=>Equals(b.Content,"LLM 交互调试")),"model interaction debug entry is missing");
 
-            var model = Descendants(window).OfType<TextBox>().Single(t => t.Text == "mimo-v2.6-pro");
-            var endpoint = Descendants(window).OfType<TextBox>().Single(t => t.Text == "https://api.xiaomimimo.com/v1/chat/completions");
+            var model = Descendants(window).OfType<TextBox>().Single(t => t.Text == "deepseek-chat");
+            var endpoint = Descendants(window).OfType<TextBox>().Single(t => t.Text == "https://api.deepseek.com/chat/completions");
             model.Text = "desktop-recovered-model";
             Click(window, "保存设置");
             await Wait(() => ModelSettings.Load(path).Model == "desktop-recovered-model", "settings were not saved");

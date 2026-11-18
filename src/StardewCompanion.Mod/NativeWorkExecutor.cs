@@ -16,42 +16,73 @@ internal sealed partial class NativeWorkExecutor
     private readonly string _action;
     private readonly JsonElement _args;
     private readonly Action<GridPoint> _interact;
+    private readonly GameLocation? _buildingTargetLocation;
+    private readonly ExecutionClock _clock=new();
     private readonly Navigation _nav=new();
     private readonly HashSet<GridPoint> _done=new();
     private readonly List<object> _results=new();
     private long _wait;
-    private long _started=Environment.TickCount64;
-    private bool _shopInteractionAttempted;
+    private readonly long _started;
+    private long _lastObservedClock;
+    private DateTime _lastClockAdvanceUtc=DateTime.UtcNow;
     private int _before;
+    private readonly int _stageMoneyBefore=Game1.player.Money;
     private GridPoint? _target;
     private CraftingPage? _crafting;
     private int _crafts;
+    private string? _craftOutputId;
+    private int _craftOutputExpected;
+    private int _craftOutputReceived;
     private bool _disposed;
+    private long _cleanupStartedAt;
+    private readonly long _promptRevisionBefore=GameEventTracker.DialogueRevision;
     internal int Completed {get;private set;}
     internal string Reason {get;private set;}="";
     internal string Phase {get;private set;}="prepare_native";
-    internal object Details=>new{action=_action,results=_results};
-    internal NativeWorkExecutor(string action,string args,Action<GridPoint> interact)
-    {_action=action;using var json=JsonDocument.Parse(args);_args=json.RootElement.Clone();_interact=interact;}
+    internal object Details=>new{action=_action,phase=Phase,verifiedCompleted=Completed,moneyBefore=_stageMoneyBefore,moneyAfter=Game1.player.Money,moneyDelta=Game1.player.Money-_stageMoneyBefore,results=_results,buildingContext=BuildingContext(),pendingPurchaseEffect=_pendingShopEffect,activeTrade=_eventTrade?.Details,
+        junimoMenu=Game1.activeClickableMenu is JunimoNoteMenu bundleMenu?new{bundleMenu.specificBundlePage,bundleIndex=bundleMenu.specificBundlePage?bundleMenu.currentPageBundle.bundleIndex:(int?)null,completionTimer=bundleMenu.specificBundlePage?bundleMenu.currentPageBundle.completionTimer:(int?)null,hasPresentButton=bundleMenu.presentButton!=null}:null};
+    internal NativeWorkExecutor(string action,string args,Action<GridPoint> interact,Farm? buildingTargetFarm=null,StardewValley.Buildings.Building? buildingAtTaskStart=null)
+    {_action=action;using var json=JsonDocument.Parse(args);_args=json.RootElement.Clone();_interact=interact;_started=_clock.Now;_lastObservedClock=_started;
+        if(action is "order_building" or "modify_building")_buildingTargetLocation=buildingTargetFarm??Game1.getFarm();
+        _buildingAtTaskStart=buildingAtTaskStart;}
+    private readonly StardewValley.Buildings.Building? _buildingAtTaskStart;
+    internal GameLocation? BuildingTargetLocation=>_buildingTargetLocation;
     private string Text(string key,string fallback="")=>_args.TryGetProperty(key,out var v)&&v.ValueKind!=JsonValueKind.Null?v.GetString()!:fallback;
     private int Num(string key,int fallback=0)=>_args.TryGetProperty(key,out var v)?v.GetInt32():fallback;
     private bool Flag(string key)=>_args.TryGetProperty(key,out var v)&&v.GetBoolean();
-    private string Map=>Text("location",Game1.currentLocation.NameOrUniqueName);
+    private string? _resolvedEntityMap;
+    private string Map=>_resolvedEntityMap??Text("location",Game1.currentLocation.NameOrUniqueName);
     private JsonElement Body=>_args.TryGetProperty("target",out var t)?t:_args.TryGetProperty("region",out var r)?r:_args;
     private GridPoint Tile=>new(Body.GetProperty("x").GetInt32(),Body.GetProperty("y").GetInt32());
     private static int Count(string id)=>BusinessExecutor.Count(id);
     private static Item? Item(string id,int? quality=null)=>Game1.player.Items.FirstOrDefault(i=>i?.QualifiedItemId==id&&(!quality.HasValue||i.Quality==quality));
-    private string End(string reason){Reason=reason;return Completed>0?"partial":"failed";}
+    private string End(string reason){Reason=reason;RecordFailureEvidence(reason);return Completed>0?"partial":"failed";}
     private string Finish(string reason){Reason=reason;return "completed";}
+    // These adapters must observe each page themselves to verify the requested read.
+    // Other notifications use the global handler, including pending purchase effects.
+    // These adapters must be allowed to advance the native dialogue which is
+    // part of their own operation. The global story-prompt handler otherwise
+    // consumes every non-question DialogueBox before the adapter can observe it.
+    internal bool HandlesStoryDialogue=>_action is "daily_info" or "attend_event" or "donate_museum" or "donate_bundle";
+    internal void SuspendForStoryPrompt(){_clock.Pause();_nav.Suspend();_eventTrade?.SuspendForStoryPrompt();}
     internal string Tick(AiInputSimulator input)
     {
+        _clock.Resume();
         if(_disposed)return End("native_operation_cancelled");
-        if(_action!="recover"&&Environment.TickCount64-_started>120000)return End("native_action_timeout:"+_action);
+        if(_action!="recover"&&_clock.Now-_started>120000)return End("native_action_timeout:"+_action);
+        var clockNow=_clock.Now;
+        if(clockNow!=_lastObservedClock){_lastObservedClock=clockNow;_lastClockAdvanceUtc=DateTime.UtcNow;}
+        else if(_action!="recover"&&DateTime.UtcNow-_lastClockAdvanceUtc>TimeSpan.FromSeconds(120))return End("native_action_clock_stalled:"+_action);
         if(_action=="approach"){var state=Near(Map,Tile,input);return state=="reached"?Finish("target_approached"):state is "blocked" or "unsupported"?End("target_unreachable"):"running";}
         if(_action=="craft")return Craft();
         if(_action=="prepare_recipe")return PrepareRecipe();
         if(_action=="recover")return Recover(input);
-        if(Game1.activeClickableMenu==null&&_action!="attend_event"&&(Game1.eventUp||Game1.player.UsingTool||!Game1.player.CanMove)){_nav.Suspend();Phase="waiting_for_native_animation";return "running";}
+        var serviceShop=_action switch{"purchase_items" or "sell_items"=>Text("shopId"),"upgrade_tool" or "collect_upgraded_tool"=>"ClintUpgrade",
+            "order_building" or "modify_building"=>"Carpenter","livestock" when Text("operation")=="purchase"=>"AnimalShop",_=>""};
+        if(!InRequestedFestivalShop&&serviceShop!=""&&Game1.activeClickableMenu==null&&GameLocation.AreStoresClosedForFestival()
+            &&ShopMap(serviceShop) is {} shopMap&&Game1.getLocationFromName(shopMap).InValleyContext())
+            return ShopBlocked(serviceShop,"shop_closed_for_festival","day_changed_recheck_native_festival_conditions");
+        if(Game1.activeClickableMenu==null&&_action!="attend_event"&&!InRequestedFestivalShop&&(Game1.eventUp||Game1.player.UsingTool||!Game1.player.CanMove)){_nav.Suspend();Phase="waiting_for_native_animation";return "running";}
         if(_action is "place" or "plant_tree" or "fertilize" or "remove_dead" or "machine" or "water_coverage" or "forage_extras")
             return Farming(input);
         return Domain(input);
@@ -66,6 +97,7 @@ internal sealed partial class NativeWorkExecutor
     private string PrepareRecipe()
     {
         var recipe=Text("recipe");if(recipe=="")return Finish("existing_items_requested");
+        if(Num("count",1)==0)return Finish("no_recipe_crafts_required");
         var known=Flag("cooking")?Game1.player.cookingRecipes:Game1.player.craftingRecipes;
         if(!known.ContainsKey(recipe))return End("recipe_not_unlocked:"+recipe);
         var definition=new CraftingRecipe(recipe,Flag("cooking"));
@@ -89,22 +121,39 @@ internal sealed partial class NativeWorkExecutor
         }
         if(!ReferenceEquals(Game1.activeClickableMenu,_crafting))return End("crafting_menu_changed");
         if(_crafting.heldItem!=null){
-            var empty=Game1.player.Items.IndexOf(null);if(empty<0){
-                var same=Game1.player.Items.Select((i,n)=>new{i,n}).FirstOrDefault(p=>p.i!=null&&p.i.canStackWith(_crafting.heldItem)&&p.i.Stack+_crafting.heldItem.Stack<=p.i.maximumStackSize());empty=same?.n??-1;
-            }
+            var outputId=_crafting.heldItem.QualifiedItemId;
+            if(_craftOutputId!=outputId||_crafting.heldItem.Stack!=_craftOutputExpected-_craftOutputReceived)return End("crafted_output_identity_or_count_changed");
+            var inventoryBefore=Count(outputId);
+            var same=Game1.player.Items.Take(Game1.player.MaxItems).Select((i,n)=>new{i,n}).FirstOrDefault(p=>p.i!=null&&p.i.canStackWith(_crafting.heldItem)&&p.i.Stack<p.i.maximumStackSize());
+            var empty=same?.n??Game1.player.Items.IndexOf(null);
             if(empty<0)return End("crafted_output_inventory_full");
-            var slot=_crafting.inventory.inventory[empty].bounds.Center;_crafting.receiveLeftClick(slot.X,slot.Y);
-            if(_crafting.heldItem!=null)return End("crafted_output_not_received");
-            Completed++;_crafts++;
+            var slot=_crafting.inventory.inventory[empty].bounds.Center;ClickMenu(_crafting,slot.X,slot.Y);
+            var received=Count(outputId)-inventoryBefore;
+            if(received<=0||received>_craftOutputExpected-_craftOutputReceived)return End("crafted_output_not_received");
+            _craftOutputReceived+=received;
+            if(_crafting.heldItem!=null){
+                if(_crafting.heldItem.QualifiedItemId!=outputId||_crafting.heldItem.Stack!=_craftOutputExpected-_craftOutputReceived)return End("crafted_output_remaining_not_verified");
+                return "running";
+            }
+            if(_craftOutputReceived!=_craftOutputExpected)return End("crafted_output_not_received");
+            _results.Add(new{recipe=Text("recipe"),outputId,received=_craftOutputReceived,verified=true});
+            Completed++;_crafts++;_craftOutputId=null;
         }
+        if(_craftOutputId!=null)return End("crafted_output_missing_before_inventory_verification");
         if(_crafts>=Num("count",1)){_crafting.exitThisMenu();return Finish("native_recipe_outputs_received");}
         var entry=_crafting.pagesOfCraftingRecipes.SelectMany((p,index)=>p.Select(pair=>(pair,index))).FirstOrDefault(e=>e.pair.Value.name==Text("recipe"));
         if(entry.pair.Key==null)return End("recipe_not_visible");
         if(!entry.pair.Value.doesFarmerHaveIngredientsInInventory())return End("recipe_materials_missing_after_partial_craft");
-        var before=BusinessExecutor.Inventory();_crafting.currentCraftingPage=entry.index;
-        var click=entry.pair.Key.bounds.Center;_crafting.receiveRightClick(click.X,click.Y);
+        // Verify output capacity before the native click consumes ingredients.
+        var preview=entry.pair.Value.createItem();
+        var capacity=Game1.player.Items.Take(Game1.player.MaxItems).Sum(i=>i==null?Math.Max(1,preview.maximumStackSize()):i.canStackWith(preview)?Math.Max(0,i.maximumStackSize()-i.Stack):0);
+        if(capacity<preview.Stack)
+            return End("crafted_output_inventory_full");
+        _crafting.currentCraftingPage=entry.index;
+        var click=entry.pair.Key.bounds.Center;ClickMenu(_crafting,click.X,click.Y,true);
         if(_crafting.heldItem==null)return End("native_recipe_did_not_create_output");
-        _results.Add(new{recipe=Text("recipe"),output=_crafting.heldItem.QualifiedItemId,count=_crafting.heldItem.Stack});
+        _craftOutputId=_crafting.heldItem.QualifiedItemId;_craftOutputExpected=_crafting.heldItem.Stack;_craftOutputReceived=0;
+        _results.Add(new{recipe=Text("recipe"),output=_crafting.heldItem.QualifiedItemId,count=_crafting.heldItem.Stack,state="held_output_pending_inventory_verification"});
         return "running";
     }
     private string Farming(AiInputSimulator input)
@@ -123,8 +172,8 @@ internal sealed partial class NativeWorkExecutor
             if(_action=="remove_dead"){
                 var tool=Game1.player.Items.OfType<MeleeWeapon>().FirstOrDefault(w=>w.isScythe());if(tool==null)return End("scythe_missing");
                 if(AreaActionExecutor.HasScytheHarvestRisk(target,tool))return End("harvestable_crop_protected_from_scythe_area");
-                if(_wait==0){Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(tool);Face(target);input.Tool=true;_wait=Environment.TickCount64+800;return "running";}
-                if(Environment.TickCount64<_wait)return "running";
+                if(_wait==0){Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(tool);Face(target);input.Tool=true;_wait=_clock.Now+800;return "running";}
+                if(_clock.Now<_wait)return "running";
                 if(Game1.currentLocation.terrainFeatures.TryGetValue(new(target.X,target.Y),out var terrain)&&terrain is HoeDirt {crop:not null})return End("dead_crop_clear_not_verified");
             }else if(!PlaceItem(Text("itemId"),target))return End("fertilizer_native_rejected");
             _done.Add(target);_target=null;_wait=0;Completed++;return "running";
@@ -134,16 +183,26 @@ internal sealed partial class NativeWorkExecutor
             var id=Text("itemId");
             if(_action=="plant_tree"&&(ItemRegistry.Create(id) is not StardewValley.Object seedling||!seedling.IsWildTreeSapling()&&!seedling.IsFruitTreeSapling()))return End("tree_seed_or_sapling_required");
             if(_action=="plant_tree"&&IsFruitTreeSapling(id)&&FruitTree.IsGrowthBlocked(new(Tile.X,Tile.Y),Game1.currentLocation))return End("fruit_tree_growth_space_blocked");
-            if(Game1.currentLocation.objects.TryGetValue(new(Tile.X,Tile.Y),out var existing)&&existing.QualifiedItemId==id){Completed=0;return Finish("already_placed");}
-            if(!PlaceItem(id,Tile))return End("native_placement_rejected");
-            Completed=1;
+            var alreadyPlaced=_action=="place"&&Game1.currentLocation.objects.TryGetValue(new(Tile.X,Tile.Y),out var existing)&&existing.QualifiedItemId==id;
+            if(!alreadyPlaced){
+                if(Game1.currentLocation.objects.ContainsKey(new(Tile.X,Tile.Y)))return End($"target_tile_occupied:{Map}:{Tile.X},{Tile.Y}");
+                if(!PlaceItem(id,Tile))return End("native_placement_rejected");
+                var verified=_action=="plant_tree"?Game1.currentLocation.terrainFeatures.TryGetValue(new(Tile.X,Tile.Y),out var planted)&&planted is Tree or FruitTree
+                    :Game1.currentLocation.objects.TryGetValue(new(Tile.X,Tile.Y),out var placed)&&placed.QualifiedItemId==id;
+                if(!verified)return End("placed_target_identity_not_verified");
+                Completed++;_results.Add(new{itemId=id,x=Tile.X,y=Tile.Y,placed=true});
+            }
             if(Body.TryGetProperty("attachmentId",out var attachment)&&attachment.ValueKind!=JsonValueKind.Null){
+                if(!Game1.currentLocation.objects.TryGetValue(new(Tile.X,Tile.Y),out var sprinkler)||!sprinkler.IsSprinkler())return End("attachment_requires_observed_sprinkler");
+                if(sprinkler.heldObject.Value?.QualifiedItemId==attachment.GetString())return Finish("sprinkler_and_attachment_already_requested_state");
+                if(sprinkler.heldObject.Value!=null)return End("sprinkler_attachment_already_occupied");
                 var item=Item(attachment.GetString()!);if(item==null)return End("attachment_missing");
                 var before=Count(item.QualifiedItemId);Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(item);_interact(Tile);
-                if(Count(item.QualifiedItemId)!=before-1)return End("attachment_consumption_not_verified");
+                if(Count(item.QualifiedItemId)!=before-1||sprinkler.heldObject.Value?.QualifiedItemId!=item.QualifiedItemId)return End("attachment_consumption_not_verified");
+                Completed++;_results.Add(new{attachmentId=item.QualifiedItemId,x=Tile.X,y=Tile.Y,installed=true});
             }
             if(_action=="plant_tree")_results.Add(new{season=Game1.currentSeason,fruitTree=IsFruitTreeSapling(id),growth=IsFruitTreeSapling(id)?"grows_in_all_seasons_fruit_depends_on_tree_season":Game1.currentSeason=="winter"?"wild_tree_winter_growth_requires_native_exception":"native_growth_rules"});
-            Completed=1;return Finish(_action=="plant_tree"?"native_tree_planted":"native_item_placed");
+            return Finish(_action=="plant_tree"?"native_tree_planted":alreadyPlaced?"existing_item_requested_state_verified":"native_item_placed");
         }
         if(_action=="machine")return ServiceMachine(input);
         return FarmingExtras(input);
@@ -159,21 +218,32 @@ internal sealed partial class NativeWorkExecutor
     private static int EmptyHand(){var empty=Game1.player.Items.IndexOf(null);return empty>=0?empty:Game1.player.Items.ToList().FindIndex(i=>i is Tool);}
     private string Recover(AiInputSimulator input)
     {
+        if(Game1.activeClickableMenu!=null&&!(Text("method")=="multiplayer_bed"&&Game1.currentLocation.lastQuestionKey=="Sleep"))return End("recovery_blocked_by_menu");
         var targetStamina=_args.GetProperty("targetStamina").GetSingle();var targetHealth=Num("targetHealth");
         if(targetStamina>Game1.player.MaxStamina||targetHealth>Game1.player.maxHealth)return End("recovery_target_exceeds_character_maximum");
+        var minutes=Game1.timeOfDay/100*60+Game1.timeOfDay%100;
+        if(_recoveryStartMinutes<0){_recoveryStartMinutes=minutes;_recoveryStartDay=Game1.Date.TotalDays;}
+        var elapsed=(Game1.Date.TotalDays-_recoveryStartDay)*1440+minutes-_recoveryStartMinutes;
+        // The deadline prevents starting another recovery action, but it must
+        // not cut off an eating animation already started within the budget.
+        // Wait for native consumption/effects to settle before emitting the
+        // final stamina, health and inventory receipt.
+        if(_wait!=0&&_clock.Now<_wait)return "running";
+        if(Game1.player.isEating)return "running";
         if(Game1.player.Stamina>=targetStamina&&Game1.player.health>=targetHealth)return Finish("requested_recovery_reached");
-        var minutes=Game1.timeOfDay/100*60+Game1.timeOfDay%100;if(_recoveryStartMinutes<0)_recoveryStartMinutes=minutes;
-        if(minutes-_recoveryStartMinutes>=Num("maxGameMinutes"))return End("recovery_requested_wait_limit");
-        if(_wait!=0&&Environment.TickCount64<_wait)return "running";
+        if(elapsed>=Num("maxGameMinutes"))return End("recovery_requested_wait_limit");
         if(Text("method")=="food"){
             if(Game1.player.isEating||!Game1.player.CanMove)return "running";
             if(Completed>=Num("maxItems"))return End("recovery_item_limit_reached");
             var food=Item(Text("itemId"),Num("quality")) as StardewValley.Object;if(food==null)return End("requested_food_missing");
             if(food.edibility.Value<=0||food.modData.ContainsKey("StardewCompanion/Protected"))return End("requested_food_not_restorative_or_protected");
             Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(food);
+            var before=Count(food.QualifiedItemId);
             Game1.player.eatObject(food);
             if(!Game1.player.isEating)return End("native_food_consumption_rejected");
-            Game1.player.reduceActiveItemByOne();Completed++;_wait=Environment.TickCount64+1500;return "running";
+            Game1.player.reduceActiveItemByOne();var consumed=before-Count(food.QualifiedItemId);
+            if(consumed!=1)return End("recovery_food_consumption_not_verified");
+            Completed++;_results.Add(new{itemId=food.QualifiedItemId,consumed,stamina=Game1.player.Stamina,health=Game1.player.health,restorationRequiresAnimationCompletion=true});_wait=_clock.Now+1500;return "running";
         }
         return RecoverByLocation(input);
     }
@@ -184,6 +254,7 @@ internal sealed partial class NativeWorkExecutor
             if(_crafting.heldItem is Item held){if(Game1.player.addItemToInventoryBool(held))_crafting.heldItem=null;else{Game1.createItemDebris(held,Game1.player.Position,Game1.player.FacingDirection,Game1.currentLocation);_crafting.heldItem=null;}}
             _crafting.exitThisMenu();
         }
+        if(_cleanupStartedAt==0)_cleanupStartedAt=Environment.TickCount64;
         return CleanupDomain();
     }
 }

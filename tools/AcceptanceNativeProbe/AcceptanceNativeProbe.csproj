@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><AllowUnsafeBlocks>false</AllowUnsafeBlocks></PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Microsoft.Diagnostics.Runtime"><HintPath>../../.tools/dotnet-dump/.store/dotnet-dump/10.0.750501/dotnet-dump/10.0.750501/tools/net8.0/any/Microsoft.Diagnostics.Runtime.dll</HintPath></Reference>
+    <Reference Include="Microsoft.Diagnostics.NETCore.Client"><HintPath>../../.tools/dotnet-dump/.store/dotnet-dump/10.0.750501/dotnet-dump/10.0.750501/tools/net8.0/any/Microsoft.Diagnostics.NETCore.Client.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

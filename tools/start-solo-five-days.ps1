@@ -1,22 +1,44 @@
 [CmdletBinding()]
-param([string]$GamePath='F:\SteamLibrary\steamapps\common\Stardew Valley',[switch]$Autonomous,[switch]$BusinessLab,[switch]$DesktopFrontend,[ValidateRange(1,112)][int]$Days=5,[string]$SettingsFile='')
+param([string]$GamePath='F:\SteamLibrary\steamapps\common\Stardew Valley',[switch]$Autonomous,[switch]$BusinessLab,[switch]$DesktopFrontend,[ValidateRange(1,112)][int]$Days=5,[string]$SettingsFile='',[string]$InitialInstructionFile='')
 $ErrorActionPreference='Stop'
 $repoRoot=Split-Path -Parent $PSScriptRoot
 if(Get-NetTCPConnection -LocalPort 27841 -State Listen -ErrorAction SilentlyContinue){throw '27841 is occupied; stop the previous diagnostic run first'}
 $runId='SC'+$Days+'D_'+(Get-Date -Format 'yyyyMMdd_HHmmss')
 if(-not $Autonomous -and -not $BusinessLab -and $Days -ne 5){throw 'Scripted runner supports five days only; use -Autonomous for a configured duration'}
-if(-not $SettingsFile){$SettingsFile=Join-Path $repoRoot '.local/model.credentials.json'}
-if($Autonomous -and -not(Test-Path -LiteralPath $SettingsFile)){throw 'Model settings are missing'}
+if($Autonomous){
+    if([string]::IsNullOrWhiteSpace($InitialInstructionFile)){throw 'Autonomous tests require -InitialInstructionFile so the intended goal is explicit before startup'}
+    $InitialInstructionFile=[IO.Path]::GetFullPath($InitialInstructionFile)
+    if(-not(Test-Path -LiteralPath $InitialInstructionFile -PathType Leaf)){throw 'Initial instruction file was not found'}
+}
+if(-not $SettingsFile){
+    if($Autonomous){
+        $settingsRoot=Join-Path $repoRoot '.local/solo5'
+        foreach($directory in (Get-ChildItem -LiteralPath $settingsRoot -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)){
+            $candidate=Join-Path $directory.FullName 'model.credentials.json'
+            if(-not(Test-Path -LiteralPath $candidate)){continue}
+            try{$configured=Get-Content -LiteralPath $candidate -Raw|ConvertFrom-Json;if($configured.model -eq 'deepseek-chat' -and -not [string]::IsNullOrWhiteSpace([string]$configured.ApiKeyDpapi)){$SettingsFile=$candidate;break}}catch{}
+        }
+        if(-not $SettingsFile){throw 'No configured DeepSeek profile is available; specify -SettingsFile'}
+    }else{$SettingsFile=Join-Path $repoRoot '.local/model.credentials.json'}
+}
+if($Autonomous){
+    if(-not(Test-Path -LiteralPath $SettingsFile)){throw 'Model settings are missing'}
+    $configured=Get-Content -LiteralPath $SettingsFile -Raw|ConvertFrom-Json
+    if($configured.model -ne 'deepseek-chat' -or [string]::IsNullOrWhiteSpace([string]$configured.ApiKeyDpapi)){throw 'Autonomous spring tests require a configured DeepSeek chat profile'}
+}
+if($DesktopFrontend -and -not(Test-Path -LiteralPath $SettingsFile -PathType Leaf)){throw 'Model settings are missing'}
+$buildScript=Join-Path $PSScriptRoot 'build.ps1'
+& $buildScript -GamePath $GamePath
+if($LASTEXITCODE -ne 0){throw 'Build failed; isolated test was not started'}
 $runRoot=Join-Path $repoRoot ('.local/solo5/'+$runId)
 $mods=Join-Path $runRoot 'Mods'
-$bridgeMod=Join-Path $mods 'StardewCompanion.Bridge';$fixtureMod=Join-Path $mods 'SoloFiveDayFixture'
-New-Item -ItemType Directory -Path $bridgeMod,$fixtureMod -Force|Out-Null
-foreach($file in @('StardewCompanion.Mod.dll','StardewCompanion.Protocol.dll','StardewCompanion.Fishing.dll','StardewMiningAgent.dll','manifest.json')){Copy-Item -LiteralPath (Join-Path $repoRoot ('src/StardewCompanion.Mod/bin/Release/net6.0/'+$file)) -Destination $bridgeMod}
-foreach($file in @('Fixture.dll','StardewCompanion.Protocol.dll','manifest.json')){Copy-Item -LiteralPath (Join-Path $repoRoot ('tools/Fixture/bin/Release/net6.0/'+$file)) -Destination $fixtureMod}
+$bridgeMod=Join-Path $mods 'StardewCompanion.Bridge'
+& (Join-Path $PSScriptRoot 'stage-solo-mods.ps1') -ModsPath $mods
+$runSettings=Join-Path $runRoot 'model.credentials.json'
+if(Test-Path -LiteralPath $SettingsFile -PathType Leaf){Copy-Item -LiteralPath $SettingsFile -Destination $runSettings}
 $sessionPath=Join-Path $runRoot 'session.json'
 $dotnet=Join-Path $repoRoot '.tools/dotnet/dotnet.exe'
 if($DesktopFrontend){
-    Copy-Item -LiteralPath $SettingsFile -Destination (Join-Path $runRoot 'model.credentials.json')
     $frontend=[Diagnostics.ProcessStartInfo]::new();$frontend.FileName=$dotnet
     $frontend.Arguments='"'+(Join-Path $repoRoot 'src/StardewCompanion.Desktop/bin/Release/net10.0-windows/StardewCompanion.dll')+'" --data "'+$runRoot+'"'+$(if($Autonomous){' --trial-days '+$Days}else{''})
     $frontend.UseShellExecute=$false;$frontend.CreateNoWindow=$false;$frontend.WindowStyle='Normal';$frontend.WorkingDirectory=$repoRoot
@@ -27,7 +49,7 @@ if($DesktopFrontend){
     $backend.UseShellExecute=$false;$backend.CreateNoWindow=$true;$backend.WorkingDirectory=$repoRoot
     if($Autonomous){$backend.Arguments='"'+(Join-Path $repoRoot 'src/StardewCompanion.Diagnostics/bin/Release/net10.0/StardewCompanion.Diagnostics.dll')+'" --agent --trial-days '+$Days}
     $backend.EnvironmentVariables['SC_SESSION_FILE']=$sessionPath;$backend.EnvironmentVariables['SC_AGENT_DATA']=$runRoot
-    $backend.EnvironmentVariables['SC_MODEL_SETTINGS']=[IO.Path]::GetFullPath($SettingsFile)
+    $backend.EnvironmentVariables['SC_MODEL_SETTINGS']=$runSettings
     $service=[Diagnostics.Process]::Start($backend)
 }
 $deadline=[DateTime]::UtcNow.AddSeconds(15)
@@ -57,6 +79,6 @@ $client=[Diagnostics.Process]::Start($game)
 @{runId=$runId;trialDays=$Days;completedAtGameDay=$Days;mode=$(if($Autonomous){'deepseek_autonomous'}else{'scripted'});createdAt=[DateTimeOffset]::Now.ToString('o');modSha256=(Get-FileHash (Join-Path $bridgeMod 'StardewCompanion.Mod.dll')).Hash;coreSha256=(Get-FileHash (Join-Path $repoRoot 'src/StardewCompanion.Diagnostics/bin/Release/net10.0/StardewCompanion.Core.dll')).Hash}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $runRoot 'trial.json') -Encoding UTF8
 Write-Output "New solo test $runId; game PID $($client.Id); evidence $runRoot"
 if($BusinessLab){exit 0}
-elseif($Autonomous){& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'watch-solo-autonomy.ps1') -RunRoot $runRoot -Days $Days}
+elseif($Autonomous){& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'watch-solo-autonomy.ps1') -RunRoot $runRoot -Days $Days -InitialInstructionFile $InitialInstructionFile}
 else{& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'run-solo-five-days.ps1') -RunRoot $runRoot}
 exit $LASTEXITCODE

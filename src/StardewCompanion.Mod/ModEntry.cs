@@ -19,8 +19,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     private bool _paused = true;
     private GameObservation? _taskBefore;
     private TaskCommand? _active;
-    private SButton _button;
-    private long _endsAt;
+
+
     private RoutineExecutor? _routine;
     private RoutineExecutor? _cleanup;
     private int? _sleepLockedDay;
@@ -30,6 +30,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     private bool _wasHealthy;
     private readonly AiInputSimulator _input = new();
     private static bool _nativeRightClick;
+    internal static bool? LastNativeInteractionResult {get;private set;}
+    internal static GridPoint? LastNativeInteractionTile {get;private set;}
     private static bool _nativeToolClick;
     private static bool _nativeToolInput;
     private static bool _manualControl;
@@ -72,8 +74,13 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             postfix: new HarmonyMethod(typeof(ModEntry), nameof(BobberBarInputPostfix)));
         new Harmony(ModManifest.UniqueID).Patch(AccessTools.Method(typeof(Utility), nameof(Utility.canGrabSomethingFromHere)),
             prefix: new HarmonyMethod(typeof(ModEntry), nameof(PreserveToolIntent)));
-        helper.ConsoleCommands.Add("sc_status", "Report M0 bridge status", (_, _) => Monitor.Log(JsonSerializer.Serialize(Observe()), LogLevel.Info));
-        Monitor.Log("M0 bridge enabled. Starts paused; only explicit diagnostic tasks are available.", LogLevel.Info);
+        var fishingPatches = new Harmony(ModManifest.UniqueID);
+        fishingPatches.Patch(AccessTools.Method(typeof(StardewValley.Tools.FishingRod), "startCasting"),
+            prefix: new HarmonyMethod(typeof(SpecialActivityExecutor), nameof(SpecialActivityExecutor.ReleaseNativeCast)));
+        fishingPatches.Patch(AccessTools.Method(typeof(StardewValley.Tools.FishingRod), "castingEndFunction"),
+            prefix: new HarmonyMethod(typeof(SpecialActivityExecutor), nameof(SpecialActivityExecutor.RecordLanding)));
+        helper.ConsoleCommands.Add("sc_status", "Report game bridge status", (_, _) => Monitor.Log(JsonSerializer.Serialize(Observe()), LogLevel.Info));
+        Monitor.Log("Game bridge enabled. Starts paused; registered skills run through the task executor.", LogLevel.Info);
     }
 
     private static void ObservePassOut(Farmer who)=>GameEventTracker.PassOut(who);
@@ -136,8 +143,10 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     {
         if(!_input.Tool)return;
         _nativeToolInput=true;
-        // Keyboard-style targeting must not depend on the human's cursor in a different window.
-        _mouseVisibilityBeforeTool=Game1.wasMouseVisibleThisFrame;Game1.wasMouseVisibleThisFrame=false;
+        // Game1 gates keyboard-style useToolButtonPressed behind this flag.
+        // Suppressing mouse clicks above keeps physical input out while this
+        // allows the native tool press to reach Farmer.FireTool/pressUseToolButton.
+        _mouseVisibilityBeforeTool=Game1.wasMouseVisibleThisFrame;Game1.wasMouseVisibleThisFrame=true;
         _nativeToolClick=Game1.player.CurrentTool is StardewValley.Tools.MeleeWeapon weapon&&weapon.isScythe();
     }
     private void RestoreToolInput()
@@ -169,7 +178,15 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                     { Emit(envelope.MessageId, "rejected", "expired_resume"); continue; }
                     _paused = false; Emit(envelope.MessageId, "completed", "resume_ack");
                 }
-                else if (envelope.Type == "cancel") { Finish("cancelled", "cancelled_by_player"); Emit(envelope.MessageId, "completed", "cancel_ack"); }
+                else if (envelope.Type == "cancel") {
+                    using var cancel=JsonDocument.Parse(envelope.Payload);
+                    if(cancel.RootElement.TryGetProperty("expectedTaskId",out var expected)){
+                        var expectedId=expected.GetString();
+                        if(envelope.SessionId!=_session||DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()-envelope.SentAtUtcMs>5000){Emit(envelope.MessageId,"rejected","expired_targeted_cancel");continue;}
+                        if(string.IsNullOrEmpty(expectedId)||_active?.TaskId!=expectedId){Emit(envelope.MessageId,"rejected","cancel_target_not_active",JsonSerializer.Serialize(new{expectedTaskId=expectedId,activeTaskId=_active?.TaskId}));continue;}
+                    }
+                    Finish("cancelled", "cancelled_by_player"); Emit(envelope.MessageId, "completed", "cancel_ack");
+                }
                 else if (envelope.Type == "task")
                 {
                     TaskCommand? command = null;
@@ -181,27 +198,33 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                     }
                     catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException or FormatException or OverflowException)
                     {
-                        Emit(command?.TaskId ?? envelope.MessageId, "rejected", "invalid_arguments");
+                        Emit(command?.TaskId ?? envelope.MessageId, "rejected", "invalid_arguments:"+ex.Message,
+                            JsonSerializer.Serialize(new{error=ex.GetType().Name,message=ex.Message}),skill:command?.Skill??"");
                     }
                 }
             }
             catch (Exception ex)
             { Monitor.Log("Invalid diagnostic command: " + ex.Message, LogLevel.Warn); }
         }
+        // The isolated AI client may be started and created through the title
+        // screen before a world is ready. Apply this runtime-only option first
+        // so losing window focus during startup cannot freeze that transition.
+        Game1.options.pauseWhenOutOfFocus = false;
         if (!Context.IsWorldReady) return;
         if(SoloTestMode.Enabled && Game1.activeClickableMenu is LevelUpMenu level && !level.isProfessionChooser)
             level.receiveGamePadButton(Buttons.B);
         // Keep background simulation active, without saving any user option changes.
-        Game1.options.pauseWhenOutOfFocus = false;
         Helper.Reflection.GetField<StardewValley.Util.IInputSimulator>(typeof(Game1), "inputSimulator").SetValue(_input);
         _input.Clear();
         _manualControl=_input.ManualControl=_paused&&SoloTestMode.Enabled;
+        var handlingStoryPrompt=HandleStoryPrompt(healthy);
         if(_manualControl)return;
         foreach (var key in Keyboard.GetState().GetPressedKeys())
             if (Enum.TryParse<SButton>(key.ToString(), out var physical)) Helper.Input.Suppress(physical);
         Helper.Input.Suppress(SButton.MouseLeft);
         Helper.Input.Suppress(SButton.MouseRight);
         if (!healthy || _paused || _active == null) return;
+        if(handlingStoryPrompt){_routine?.SuspendForStoryPrompt();return;}
         if (_routine != null)
         {
             try
@@ -212,23 +235,28 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 if (status != "running") { Finish(status, _routine.Reason); return; }
                 if (_routine.ProgressDue) { Emit(_active.TaskId, "progress", _routine.Phase, JsonSerializer.Serialize(_routine.BusinessDetails), _routine.Completed); _routine.ProgressSent(); }
             }
-            catch (Exception ex) { Monitor.Log("Routine stopped: " + ex, LogLevel.Warn); Finish("failed", "routine_exception:"+ex.GetType().Name+":"+ex.Message); }
+            catch (Exception ex) { Monitor.Log("Routine stopped: " + ex, LogLevel.Warn); Finish(_routine.Completed>0?"partial":"failed", "routine_exception:"+ex.GetType().Name+":"+ex.Message); }
             return;
         }
-        if (Environment.TickCount64 >= _endsAt) { Finish("completed", "input_finished"); return; }
-        if (_active.Skill == "walk" && Game1.activeClickableMenu != null) { Finish("failed", "menu_open"); return; }
-        if (_active.Skill == "walk")
-            _input.Direction = _button switch { SButton.W => "up", SButton.S => "down", SButton.A => "left", SButton.D => "right", _ => "" };
-        else if (_active.Skill == "use_tool") _input.Tool = true;
-        else if (_active.Skill == "interact") _input.Interact = true;
-        else Helper.Input.Press(_button);
-        PrepareNativeToolInput();
+    }
+
+    private bool HandleStoryPrompt(bool bridgeHealthy)
+    {
+        if(Game1.activeClickableMenu is not DialogueBox dialogue){GameEventTracker.ClearDialogue();return false;}
+        var blockedTaskId=_active is { Skill: not "respond_dialogue" } blockingTask?blockingTask.TaskId:null;
+        var scriptWillAcknowledge=bridgeHealthy&&!_paused&&!_manualControl&&!dialogue.isQuestion&&_active?.Skill!="respond_dialogue";
+        GameEventTracker.ObserveDialogue(_active?.TaskId,blockedTaskId,scriptWillAcknowledge);
+        if(!scriptWillAcknowledge||_routine?.HandlesStoryDialogue==true)return false;
+        var text=dialogue.getCurrentString()??"";
+        if(text.Length==0||dialogue.transitioning||dialogue.safetyTimer>0||dialogue.characterIndexInDialogue<text.Length-1)return true;
+        dialogue.receiveLeftClick(dialogue.x+64,dialogue.y+64);
+        return true;
     }
 
     private void OnTicked(object? sender, UpdateTickedEventArgs e)
     {
         RestoreToolInput();
-        if (_bridge != null && e.IsMultipleOf(15)) {GameEventTracker.Poll();_bridge.Send("observation", _session, Observe());}
+        if (_bridge != null && e.IsMultipleOf(15)) {GameEventTracker.Poll(_active?.TaskId);_bridge.Send("observation", _session, Observe());}
     }
 
     private GameObservation Observe()
@@ -273,6 +301,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
 
     private static string DescribeMenuContext()
     {
+        if(Game1.activeClickableMenu?.GetType().Name=="NamingMenu")
+            return JsonSerializer.Serialize(new{type="NamingMenu",text="原版命名界面需要玩家输入名称；自动工具不能填写。",question=false,choices=Array.Empty<object>(),playerInputRequired=true});
         if(Game1.activeClickableMenu is not DialogueBox dialogue)
             return JsonSerializer.Serialize(new{type=Game1.activeClickableMenu?.GetType().Name??"",text="",question=false,choices=Array.Empty<object>()});
         var text=dialogue.getCurrentString()??"";
@@ -292,6 +322,11 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             : command.ObservationRevision > _revision || _revision - command.ObservationRevision > 20 ? "stale_observation" : null;
         if (reason != null) { Emit(command.TaskId, "rejected", reason); return; }
         using var args = JsonDocument.Parse(command.Arguments);
+        if(Game1.activeClickableMenu?.GetType().Name=="NamingMenu"
+            &&command.Skill is not ("observe" or "inspect_target" or "inspect_targets" or "inspect_route" or "inspect_area" or "read_mailbox")
+            &&BusinessCapabilities.Find(command.Skill) is not {Query:true})
+        {Emit(command.TaskId,"rejected","player_input_required:NamingMenu",skill:command.Skill);return;}
+        ExecutionTargets.ValidateCommandBounds(command.Skill,args.RootElement);
         if(command.Skill=="mine_travel"){Emit(command.TaskId,"rejected","skill_disabled:mine_travel",skill:command.Skill);return;}
         foreach(var field in new[]{"location","destination","toLocation"})
             if(args.RootElement.TryGetProperty(field,out var destination)&&destination.ValueKind==JsonValueKind.String){
@@ -307,6 +342,13 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         }
         if (command.Skill is "observe" or "inspect_target" or "inspect_targets" or "inspect_route" or "inspect_area" or "read_mailbox")
         {
+            if(command.Skill=="inspect_route"){
+                var target=args.RootElement.GetProperty("location").GetString()!;
+                var route=Navigation.Route(Game1.currentLocation.NameOrUniqueName,target);
+                if(Game1.getLocationFromName(target)==null||route==null){
+                    Emit(command.TaskId,"rejected",Game1.getLocationFromName(target)==null?"target_location_unknown":"route_unreachable",JsonSerializer.Serialize(new{requestedLocation=target,currentLocation=Game1.currentLocation.NameOrUniqueName}),skill:command.Skill);return;
+                }
+            }
             object details = command.Skill switch
             {
                 "read_mailbox" => GameEventTracker.ReadMailbox(),
@@ -319,7 +361,10 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 "inspect_targets" => WorldView.InspectMany(args.RootElement),
                 _ => WorldView.Read()
             };
-            Emit(command.TaskId, "completed", "observation", JsonSerializer.Serialize(details),skill:command.Skill); return;
+            var serialized=JsonSerializer.Serialize(details);
+            using var queryResult=JsonDocument.Parse(serialized);
+            var blocked=queryResult.RootElement.ValueKind==JsonValueKind.Object&&queryResult.RootElement.TryGetProperty("status",out var queryStatus)&&queryStatus.GetString()=="blocked";
+            Emit(command.TaskId, blocked?"rejected":"completed", blocked?"requires_current_observed_location":"observation", serialized,skill:command.Skill); return;
         }
         if (_paused || _active != null || _sleepLockedDay == Game1.Date.TotalDays)
         { Emit(command.TaskId, "rejected", _paused ? "paused" : _active != null ? "busy" : "waiting_for_next_day"); return; }
@@ -334,82 +379,24 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         }
         if (RoutineExecutor.Skills.Contains(command.Skill))
         {
+            var normalized=ExecutionTargets.NormalizePrimitive(command.Skill,command.Arguments,out var targetFailure);
+            if(targetFailure!=null){Emit(command.TaskId,"rejected",targetFailure.Reason,JsonSerializer.Serialize(targetFailure),skill:command.Skill);return;}
+            command.Arguments=normalized.GetRawText();
             _routine = new RoutineExecutor(command.Skill, command.Arguments, NativeInteract, command.EncounterPolicy);
             _active = command; _taskBefore=Observe();_start = _taskBefore.Tile;
             Emit(command.TaskId, "accepted", "routine_started"); return;
         }
-        var duration = 60;
-        switch (command.Skill)
-        {
-            case "face":
-                var directionValue = args.RootElement.GetProperty("direction").GetInt32();
-                if (directionValue < 0 || directionValue > 3) { Emit(command.TaskId, "rejected", "invalid_direction"); return; }
-                Game1.player.faceDirection(directionValue);
-                Emit(command.TaskId, "completed", "facing_set");
-                return;
-            case "menu_click":
-                if (Game1.activeClickableMenu is not ItemGrabMenu itemMenu) { Emit(command.TaskId, "rejected", "not_container_menu"); return; }
-                var panel = args.RootElement.GetProperty("panel").GetString();
-                var inventoryMenu = panel switch { "container" => itemMenu.ItemsToGrabMenu, "player" => itemMenu.inventory, _ => null };
-                var itemSlot = args.RootElement.GetProperty("slot").GetInt32();
-                if (inventoryMenu == null || itemSlot < 0 || itemSlot >= inventoryMenu.inventory.Count)
-                { Emit(command.TaskId, "rejected", "invalid_menu_slot"); return; }
-                var click = inventoryMenu.inventory[itemSlot].bounds.Center;
-                itemMenu.receiveLeftClick(click.X, click.Y);
-                Emit(command.TaskId, "completed", "native_menu_click");
-                return;
-            case "select_item":
-                var slot = args.RootElement.GetProperty("slot").GetInt32();
-                if (slot < 0 || slot >= Game1.player.Items.Count || Game1.player.Items[slot] == null)
-                { Emit(command.TaskId, "rejected", "invalid_slot"); return; }
-                Game1.player.CurrentToolIndex = slot;
-                Emit(command.TaskId, "completed", "selected_item");
-                return;
-            case "walk":
-                var direction = args.RootElement.GetProperty("direction").GetString();
-                _button = direction switch { "up" => SButton.W, "down" => SButton.S, "left" => SButton.A, "right" => SButton.D, _ => SButton.None };
-                duration = args.RootElement.TryGetProperty("milliseconds", out var ms) ? ms.GetInt32() : 300;
-                if (duration < 1 || duration > 1500 || _button == SButton.None) { Emit(command.TaskId, "rejected", "invalid_walk"); return; }
-                break;
-            case "use_tool": _button = SButton.C; break;
-            case "interact":
-                var toolTarget = Game1.player.GetToolLocation(ignoreClick: true);
-                var interactionTile = new Vector2((int)(toolTarget.X / 64), (int)(toolTarget.Y / 64));
-                if (args.RootElement.TryGetProperty("x", out var ix) && args.RootElement.TryGetProperty("y", out var iy))
-                    interactionTile = new Vector2(ix.GetInt32(), iy.GetInt32());
-                bool handled;
-                // Chest.checkForAction requires an actual right-click edge in addition to actionButtonPressed.
-                // Scope that synthetic edge to this native call; don't hold a mouse button or move the OS cursor.
-                try { _nativeRightClick = true; handled = Game1.tryToCheckAt(interactionTile, Game1.player); }
-                finally { _nativeRightClick = false; }
-                Emit(command.TaskId, handled ? "completed" : "failed", handled ? "native_interaction_dispatched" : "interaction_not_handled");
-                return;
-            case "menu_confirm":
-                if (Game1.activeClickableMenu is not DialogueBox dialogue || Game1.currentLocation.lastQuestionKey != "Sleep"
-                    || !Game1.player.isInBed.Value || !ReferenceEquals(Utility.getHomeOfFarmer(Game1.player), Game1.currentLocation))
-                { Emit(command.TaskId, "rejected", "not_own_bed_sleep_question"); return; }
-                var response = Array.FindIndex(dialogue.responses, r => r.responseKey == "Yes");
-                if (response < 0) { Emit(command.TaskId, "rejected", "no_sleep_yes_response"); return; }
-                dialogue.selectedResponse = response;
-                dialogue.receiveLeftClick(0, 0);
-                Emit(command.TaskId, "completed", "native_sleep_dialogue_click");
-                return;
-            case "menu_cancel":
-                if (Game1.activeClickableMenu == null) { Emit(command.TaskId, "rejected", "no_menu"); return; }
-                Game1.activeClickableMenu.receiveKeyPress(Keys.Escape);
-                Emit(command.TaskId, "completed", "native_menu_cancel");
-                return;
-            default: Emit(command.TaskId, "rejected", "unsupported_m0_skill"); return;
-        }
-        _active = command;
-        _start = Observe().Tile;
-        _endsAt = Environment.TickCount64 + duration;
-        Emit(command.TaskId, "accepted", "m0_diagnostic_input");
+        Emit(command.TaskId, "rejected", "unsupported_skill",skill:command.Skill);
     }
 
     private static void NativeInteract(GridPoint tile)
     {
-        try { _nativeRightClick = true; Game1.tryToCheckAt(new Vector2(tile.X, tile.Y), Game1.player); }
+        var current=Game1.player.TilePoint;
+        var dx=tile.X-current.X;var dy=tile.Y-current.Y;
+        if(Math.Abs(dx)>Math.Abs(dy))Game1.player.faceDirection(dx>0?1:3);
+        else if(dx!=0||dy!=0)Game1.player.faceDirection(dy>0?2:0);
+        LastNativeInteractionTile=tile;LastNativeInteractionResult=null;
+        try { _nativeRightClick = true; LastNativeInteractionResult=Game1.tryToCheckAt(new Vector2(tile.X, tile.Y), Game1.player); }
         finally { _nativeRightClick = false; }
     }
 
@@ -428,11 +415,11 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         _routine = null;
         _active = null;
         _input.Clear();
-        _button = SButton.None;
+
+        GameEventTracker.Poll(task.TaskId);
         var after = Observe();
-        var moved = _start != null && (_start.X != after.Tile.X || _start.Y != after.Tile.Y);
-        Emit(task.TaskId, task.Skill == "walk" && status == "completed" && !moved ? "failed" : status,
-            task.Skill == "walk" && status == "completed" && !moved ? "no_tile_displacement" : reason,
+        _bridge?.Send("observation",_session,after);
+        Emit(task.TaskId,status,reason,
             JsonSerializer.Serialize(new { requestedTarget=JsonSerializer.Deserialize<JsonElement>(task.Arguments),playerStart = _start, playerEnd = after.Tile, after.Location,collectedItems,remainingDrops,
                 affectedTiles,
                 businessDetails,

@@ -31,6 +31,17 @@ internal static class WorldView
             maxStamina = Game1.player.MaxStamina,
             farmName=Game1.player.farmName.Value,money=Game1.player.Money,rain=location.IsRainingHere(),
             decisionFacts=DecisionFacts(),
+            junimoBundles=JunimoBundles(location),
+            museumDisplay=location is LibraryMuseum museum?new{
+                museumPieces=museum.museumPieces.Keys.Select(key=>new{x=(int)key.X,y=(int)key.Y,itemId=museum.museumPieces[key]}).ToArray(),
+                availableTiles=Enumerable.Range(0,location.Map.Layers[0].LayerWidth)
+                    .SelectMany(x=>Enumerable.Range(0,location.Map.Layers[0].LayerHeight).Select(y=>new{x,y}))
+                    .Where(p=>museum.isTileSuitableForMuseumPiece(p.x,p.y)).Take(128).ToArray(),
+                totalAvailableTiles=Enumerable.Range(0,location.Map.Layers[0].LayerWidth)
+                    .Sum(x=>Enumerable.Range(0,location.Map.Layers[0].LayerHeight).Count(y=>museum.isTileSuitableForMuseumPiece(x,y))),
+                meaning="Native museum occupancy and currently valid empty display tiles; select a listed coordinate for donation"
+            }:null,
+            activeEvent=location.currentEvent is {} currentEvent?new{id=currentEvent.id,isFestival=currentEvent.isFestival}:null,
             fishing = new
             {
                 rodEquipped=Game1.player.CurrentTool is FishingRod,
@@ -52,13 +63,16 @@ internal static class WorldView
                 lockedElevatorLevels="查询游戏原生电梯菜单时才确定",visibleExits=location.warps.Select(w=>new{x=w.X,y=w.Y,target=w.TargetName,targetX=w.TargetX,targetY=w.TargetY}).ToArray()
             }:null,
             water = (Game1.player.Items.FirstOrDefault(i => i is WateringCan) as WateringCan)?.WaterLeft,
+            nearbyRefillTiles = NearbyRefillTiles(location),
             mailbox=GameEventTracker.Mailbox(),
             gameEvents=GameEventTracker.Pending(),
             inventoryState=new{capacity=Game1.player.MaxItems,occupiedSlots=Game1.player.Items.Count(i=>i!=null),freeSlots=Math.Max(0,Game1.player.MaxItems-Game1.player.Items.Count(i=>i!=null))},
-            inventory = Game1.player.Items.Select((i, slot) => new { slot, id = i?.QualifiedItemId, name = i?.DisplayName, count = i?.Stack ?? 0, tool = i is Tool }),
+            inventory = Game1.player.Items.Select((i, slot) => new { slot, id = i?.QualifiedItemId, name = i?.DisplayName, count = i?.Stack ?? 0, tool = i is Tool, isSeed = i?.Category == StardewValley.Object.SeedsCategory }),
             animals=location.animals.Values.Select(a=>new{id=a.myID.Value.ToString(),name=a.displayName,type=a.type.Value,x=a.TilePoint.X,y=a.TilePoint.Y,petted=a.wasPet.Value,homeId=a.home?.id.Value.ToString()}),
             pets=location.characters.OfType<StardewValley.Characters.Pet>().Select(p=>new{id=p.petId.Value.ToString(),name=p.displayName,x=p.TilePoint.X,y=p.TilePoint.Y,pettedToday=p.lastPetDay.TryGetValue(Game1.player.UniqueMultiplayerID,out var petDay)&&petDay==Game1.Date.TotalDays}),
             buildings=location.buildings.Select(b=>new{id=b.id.Value.ToString(),type=b.buildingType.Value,x=b.tileX.Value,y=b.tileY.Value,width=b.tilesWide.Value,height=b.tilesHigh.Value,indoors=b.GetIndoors()?.NameOrUniqueName,constructionDaysRemaining=b.daysOfConstructionLeft.Value,bowlWatered=b is StardewValley.Buildings.PetBowl bowl?(bool?)bowl.watered.Value:null}),
+            livestockHomes=Game1.getFarm().buildings.Where(b=>b.GetIndoors() is AnimalHouse).Select(b=>new{buildingId=b.id.Value.ToString(),type=b.buildingType.Value,interior=b.GetIndoors()!.NameOrUniqueName,constructionDaysRemaining=b.daysOfConstructionLeft.Value,upgradeDaysRemaining=b.daysUntilUpgrade.Value}),
+            homeUpgradeLevel=Utility.getHomeOfFarmer(Game1.player).upgradeLevel,
             toolUpgrade=Game1.player.toolBeingUpgraded.Value is {} upgrading?new{toolId=upgrading.QualifiedItemId,level=upgrading.UpgradeLevel,daysRemaining=Game1.player.daysLeftForToolUpgrade.Value}:null,
             knownRecipes=new{crafting=Game1.player.craftingRecipes.Keys.OrderBy(n=>n).ToArray(),cooking=Game1.player.cookingRecipes.Keys.OrderBy(n=>n).ToArray()},
             players = Game1.getOnlineFarmers().Select(p => new { id = p.UniqueMultiplayerID.ToString(), name = p.Name, location = p.currentLocation?.NameOrUniqueName, x = p.TilePoint.X, y = p.TilePoint.Y }),
@@ -70,7 +84,8 @@ internal static class WorldView
                 id=d.item?.QualifiedItemId??d.itemId.Value,name=d.item?.DisplayName,count=d.item?.Stack??d.Chunks.Count,
                 tiles=d.Chunks.Select(c=>new{x=(int)((c.position.X+32)/64),y=(int)((c.position.Y+32)/64)}).ToArray()
             }).Take(128),
-            npcs = location.characters.Select(c=>new{name=c.Name,x=c.TilePoint.X,y=c.TilePoint.Y}),
+            npcs = location.characters.Select(c=>new{name=c.Name,displayName=c.displayName,x=c.TilePoint.X,y=c.TilePoint.Y,
+                friendship=Game1.player.friendshipData.TryGetValue(c.Name,out var friend)?new{points=friend.Points,talkedToToday=friend.TalkedToToday,giftsToday=friend.GiftsToday}:null}),
             chairs = Chairs(location),
             naturalObstacles = NaturalObstacles(location),
             chests = location.objects.Pairs.Where(p => p.Value is Chest).Select(p => new { x = (int)p.Key.X, y = (int)p.Key.Y, id = p.Value.modData.TryGetValue(ChestKey, out var id) ? id : null, itemId = p.Value.QualifiedItemId, knowledge = "contents_require_inspection" }),
@@ -82,6 +97,14 @@ internal static class WorldView
         };
     }
     private static object[] Chairs(GameLocation location)=>FindChairs(location).Select(c=>new{name=c.Name,type=c.Type,x=c.X,y=c.Y}).Cast<object>().ToArray();
+    private static object[] NearbyRefillTiles(GameLocation location)
+    {
+        var tile=Game1.player.TilePoint;var result=new List<object>();
+        for(var x=Math.Max(0,tile.X-5);x<=Math.Min(location.Map.Layers[0].LayerWidth-1,tile.X+5);x++)
+            for(var y=Math.Max(0,tile.Y-5);y<=Math.Min(location.Map.Layers[0].LayerHeight-1,tile.Y+5);y++)
+                if(Math.Abs(x-tile.X)+Math.Abs(y-tile.Y)<=5&&location.CanRefillWateringCanOnTile(x,y))result.Add(new{x,y});
+        return result.ToArray();
+    }
     private static ChairSpot[] FindChairs(GameLocation location)
     {
         var member=location.GetType().GetProperty("furniture",BindingFlags.Instance|BindingFlags.Public|BindingFlags.NonPublic)?.GetValue(location)
@@ -109,7 +132,8 @@ internal static class WorldView
             var type=pair.Value.Name;
             if(type is not ("Stone" or "Twig" or "Weeds"))continue;
             var x=(int)pair.Key.X;var y=(int)pair.Key.Y;if(Math.Abs(x-player.X)+Math.Abs(y-player.Y)>12)continue;
-            result.Add(new{x,y,type,breakable=true,passable=Navigation.Passable(new(x,y)),requires=type=="Stone"?"Pickaxe":"Axe"});
+            var requires=type switch{"Stone"=>"Pickaxe","Weeds"=>"Scythe",_=>"Axe"};
+            result.Add(new{x,y,type,breakable=true,passable=Navigation.Passable(new(x,y)),requires});
         }
         foreach(var pair in location.terrainFeatures.Pairs)
         {
@@ -142,7 +166,8 @@ internal static class WorldView
                 cropsNeedingWater=location.terrainFeatures.Values.OfType<HoeDirt>().Count(d=>NeedsWater(d,location))};
         return new{
             autonomy="LLM决定是否继续工作、返家或睡觉，本地无体力/时间接管",
-            calendar=new{season=Game1.currentSeason,dayOfSeason=Game1.dayOfMonth,dayOfWeek=new[]{"Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"}[Math.Clamp((Game1.dayOfMonth-1)%7,0,6)],timeOfDayHHMM=Game1.timeOfDay,clockMeaning="HHMM-style; 1320 means 13:20"},
+            calendar=new{season=Game1.currentSeason,dayOfSeason=Game1.dayOfMonth,dayOfWeek=new[]{"Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"}[Math.Clamp((Game1.dayOfMonth-1)%7,0,6)],timeOfDayHHMM=Game1.timeOfDay,clockMeaning="HHMM-style; 1320 means 13:20",
+                pierreWednesdayUnlocked=Utility.HasAnyPlayerSeenEvent("191393")||p.HasTownKey,storesClosedForFestival=GameLocation.AreStoresClosedForFestival()},
             stamina=p.Stamina,maxStamina=p.MaxStamina,exhausted=p.exhausted.Value,health=p.health,maxHealth=p.maxHealth,
             nativePassOutStaminaThreshold=-15,staminaUntilNativePassOut=Math.Max(0,p.Stamina+15),
             nativeForcedPassOutTime=2600,gameMinutesUntil2AM=Math.Max(0,26*60-minutes),
@@ -170,6 +195,35 @@ internal static class WorldView
                 .OrderBy(o=>o.distanceEstimate).Take(20).ToArray(),
             unknown="未观察地图、未验证路线和未来随机收益仍未知"};
     }
+    private static object? JunimoBundles(GameLocation location)
+    {
+        if(location is not CommunityCenter center)return null;
+        var scrolls=new List<object>();
+        for(var x=0;x<location.Map.Layers[0].LayerWidth;x++)for(var y=0;y<location.Map.Layers[0].LayerHeight;y++){
+            var action=location.doesTileHaveProperty(x,y,"Action","Buildings");
+            if(action is null)continue;
+            var parts=action.Split(' ',StringSplitOptions.RemoveEmptyEntries);
+            if(parts.Length>=2&&parts[0]=="JunimoNote"&&int.TryParse(parts[1],out var area))scrolls.Add(new{area,x,y,action});
+        }
+        var bundles=Game1.netWorldState.Value.BundleData.Select(pair=>{
+            var keyParts=pair.Key.Split('/',StringSplitOptions.RemoveEmptyEntries);
+            var areaName=keyParts.Length>1?keyParts[0]:"";
+            var bundleId=keyParts.Length>1&&int.TryParse(keyParts[^1],System.Globalization.NumberStyles.Integer,System.Globalization.CultureInfo.InvariantCulture,out var parsedId)?parsedId:-1;
+            center.bundles.TryGetValue(bundleId,out var slots);
+            var area=areaName switch{"Pantry"=>0,"Crafts Room"=>1,"Fish Tank"=>2,"Boiler Room"=>3,"Vault"=>4,"Bulletin Board"=>5,_=>-1};
+            var parts=pair.Value.Split('/');var tokens=parts.Length>2?parts[2].Split(' ',StringSplitOptions.RemoveEmptyEntries):Array.Empty<string>();
+            var slotCount=tokens.Length/3;
+            var requirements=Enumerable.Range(0,slotCount).Select(slot=>{
+                var id=tokens[slot*3];var count=int.TryParse(tokens[slot*3+1],out var requiredCount)?requiredCount:0;
+                var quality=int.TryParse(tokens[slot*3+2],out var requiredQuality)?requiredQuality:0;
+                var qualifiedId=id.StartsWith('(')?id:"(O)"+id;
+                var itemName=ItemRegistry.Create(qualifiedId)?.DisplayName??qualifiedId;
+                return new{slot,itemId=qualifiedId,itemName,count,quality,complete=slot<(slots?.Length??0)&&slots![slot]};
+            }).ToArray();
+            return new{area,areaName,bundleId,name=parts.Length>0?parts[0]:pair.Key,requirements,completedSlots=slots??Array.Empty<bool>(),availableSlots=requirements.Where(s=>!s.complete).Select(s=>new{slot=s.slot,complete=s.complete,itemId=s.itemId,itemName=s.itemName,count=s.count,quality=s.quality}).ToArray()};
+        }).ToArray();
+        return new{scrolls,bundles,meaning="Native BundleData and current completion bits; use the listed bundleId and incomplete slot indexes. An absent scroll means the area is not currently exposed by the native map."};
+    }
     internal static bool Ready(Crop? crop) => crop != null && !crop.dead.Value && crop.currentPhase.Value >= crop.phaseDays.Count - 1 && (!crop.fullyGrown.Value || crop.dayOfCurrentPhase.Value <= 0);
     internal static bool NeedsWater(HoeDirt dirt,GameLocation location)=>dirt.crop!=null&&!dirt.crop.dead.Value&&dirt.state.Value!=1&&!location.IsRainingHere();
     internal static object Inspect(int x, int y)
@@ -182,6 +236,7 @@ internal static class WorldView
             diggable=Game1.currentLocation.doesTileHaveProperty(x,y,"Diggable","Back")!=null,
             passable=Navigation.Passable(new(x,y)),
             itemId = obj?.QualifiedItemId, name = obj?.DisplayName,
+            machine = obj==null||obj is Chest?null:new{outputId=obj.heldObject.Value?.QualifiedItemId,outputName=obj.heldObject.Value?.DisplayName,outputCount=obj.heldObject.Value?.Stack??0,readyForHarvest=obj.readyForHarvest.Value,minutesRemaining=obj.MinutesUntilReady},
             chestId = obj?.modData.TryGetValue(ChestKey, out var id) == true ? id : null,
             soil=soil==null?null:new{crop=soil.crop?.indexOfHarvest.Value,dead=soil.crop?.dead.Value??false,watered=soil.state.Value==1,
                 needsWater=NeedsWater(soil,Game1.currentLocation),ready=Ready(soil.crop)},

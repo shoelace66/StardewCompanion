@@ -14,11 +14,7 @@ public sealed partial class CompanionRuntime
     private long _waitDue;
     private int _decisionRequested;
     private string _waitFingerprint="";
-    private string _lastActionFingerprint="";
-    private string _lastActionState="";
-    private int _unchangedFailures;
     private string _lastFailureReason="";
-    private object? _lastPlan;
     private readonly Queue<object> _queryFacts=new();
 
     private static string FactFingerprint(GameObservation s)
@@ -32,10 +28,16 @@ public sealed partial class CompanionRuntime
     {
         var s=_bridge.Observation!;
         if(Mode=="plan_only"){SaveWorkPlan(args,args["steps"],false);return new{status="saved_plan_only",executed=false};}
+        EnsureRequiredPlans(s);
         if(!_resumed||_planTask is {IsCompleted:false}||s.ActiveTaskId!="")throw new InvalidOperationException("当前忙碌或已暂停，不能提交新计划");
         var normalized=(JsonObject)args.DeepClone();
-        var work=WorkState();
-        if(normalized["goal"] is null){var goal=work["currentObjective"]?.ToString();if(string.IsNullOrWhiteSpace(goal))goal=PlayerGoal["objective"]?.ToString();normalized["goal"]=JsonValue.Create(string.IsNullOrWhiteSpace(goal)?"执行明确操作":goal);}
+        if(normalized["goal"] is null){
+            // plan_finished.goal must reflect this plan, not a prior task's
+            // retained work objective. Prefer the stable player goal; never
+            // inherit a stale per-task objective across tasks.
+            var goal=PlayerGoal["objective"]?.ToString();
+            normalized["goal"]=JsonValue.Create(string.IsNullOrWhiteSpace(goal)?"执行明确操作":goal);
+        }
         normalized["basis"]??=JsonValue.Create($"{s.Location} {s.TimeOfDay/100:D2}:{s.TimeOfDay%100:D2}; day {s.GameDay}; observed revision {s.Revision}");
         normalized["assumptions"]??=new JsonArray();
         normalized["successCriteria"]??=new JsonArray();
@@ -55,7 +57,6 @@ public sealed partial class CompanionRuntime
         SaveWorkPlan(normalized,normalized["steps"],false);
         _planIds[key]="running";
         _memory.Set(_scope,memoryKey,"running");
-        _scopedPlanSkills=plan.Steps.Select(s=>s.Skill).Distinct().ToArray();_expandedTools=false;
         _planCancellation?.Dispose();_planCancellation=CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         _planTask=ExecutePlan(plan,decision,_scope,_session,s.GameDay,_planCancellation.Token,DecisionContextCompression.Text(normalized,"goal"));
         return new{status="accepted",planId=plan.Id,steps=plan.Steps.Length};
@@ -74,18 +75,15 @@ public sealed partial class CompanionRuntime
                 var step=plan.Steps[i];ValidateSkillScope(step.Skill,step.Arguments);var state=_bridge.Observation!;
                 if(!_resumed||scope!=_scope||session!=_session||day!=state.GameDay||!_bridge.Fresh||!ControlModePolicy.CanControl(state))
                     throw new InvalidOperationException("plan_context_changed");
-                var signature=step.Skill+":"+step.Arguments.ToJsonString();
-                var facts=FactFingerprint(state);
-                if(signature==_lastActionFingerprint&&facts==_lastActionState&&_unchangedFailures>0)
-                    throw new InvalidOperationException("unchanged_target_previously_failed:"+_lastFailureReason+":目标及相关状态未变化，先解决阻塞或选择其他工作");
+                EnsureRequiredPlans(state);
                 var authorized=PermissionPolicy.Authorize(step.Skill,step.Arguments,_memory.Chests(scope),state);
-                var taskId=Guid.NewGuid().ToString("N");_taskDecisions[taskId]=decision;
+                var taskId=Guid.NewGuid().ToString("N");BeginAction(taskId,step.Skill,authorized,state);_taskDecisions[taskId]=decision;
                 Trace("permission_allowed",new{name=step.Skill,arguments=authorized,planId=plan.Id,step=i},decision);
                 Trace("task_dispatch",new{taskId,skill=step.Skill,arguments=authorized,source="model",planId=plan.Id,step=i},decision);
-                var receipt=await new ShortPlanExecutor(_bridge).Step(step.Skill,authorized,taskId,ct,plan.EncounterPolicy);
+                TaskResult receipt;
+                try{receipt=await new ShortPlanExecutor(_bridge).Step(step.Skill,authorized,taskId,ct,plan.EncounterPolicy);FinishAction(receipt);}
+                finally{ForgetAction(taskId);}
                 results.Add(new{step=i,receipt});
-                _lastActionFingerprint=signature;_lastActionState=FactFingerprint(_bridge.Observation!);
-                _unchangedFailures=receipt.Status!="completed"?1:0;
                 _lastFailureReason=receipt.Status!="completed"?receipt.Reason:"";
                 if(receipt.Status!="completed"){status="stopped";reason=receipt.Reason;break;}
             }
@@ -94,6 +92,7 @@ public sealed partial class CompanionRuntime
         catch(Exception ex){status="stopped";reason=SafeError(ex);if(scope==_scope&&session==_session&&_resumed)await _bridge.Control("cancel");}
         finally
         {
+            if(status!="completed"&&scope==_scope&&session==_session)DiscardContinuation(failed:true);
             var finalFacts=_bridge.Observation is {} finalState?FactFingerprint(finalState):"";
             _planIds[scope+":"+session+":"+plan.Id]=finalFacts;
             _memory.Set(scope,"plan_seen:"+session+":"+plan.Id,finalFacts);
@@ -101,7 +100,7 @@ public sealed partial class CompanionRuntime
             RecordPlanEvidence(scope,plan.Id,summary,status=="completed"?"batch_completed":status);
             if(scope==_scope&&session==_session)RetireWorkingBatch(plan.Id);
             Decisions.Write(scope,session,decision,"plan_finished",summary);
-            if(scope==_scope&&session==_session){_lastPlan=summary;RecordActionFeedback(summary);WakeDecision();}
+            if(scope==_scope&&session==_session){RecordActionFeedback(summary);WakeDecision();}
         }
     }
     private object CompactObservation(GameObservation s)=>new{

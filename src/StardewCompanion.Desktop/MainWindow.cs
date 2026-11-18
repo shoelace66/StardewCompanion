@@ -23,8 +23,8 @@ public sealed class MainWindow:Window
     private readonly TextBlock _world=new(){Text="等待 AI 加入房间",TextWrapping=TextWrapping.Wrap};
     private readonly TextBlock _question=new(){TextWrapping=TextWrapping.Wrap};
     private readonly TextBox _chat=new(){IsReadOnly=true,AcceptsReturn=true,TextWrapping=TextWrapping.Wrap,VerticalScrollBarVisibility=ScrollBarVisibility.Auto,MinHeight=250};
-    private readonly TextBox _message=new(){AcceptsReturn=true,TextWrapping=TextWrapping.Wrap,Height=72,VerticalScrollBarVisibility=ScrollBarVisibility.Auto,ToolTip="输入消息或回答 AI；长期目标在操作流窗口单独编辑。Enter 发送，Shift+Enter 换行"};
-    private readonly TextBlock _chatHint=new(){Text="给 AI 的目标和补充要求会显示在上方对话中。Enter 发送，Shift+Enter 换行。自主执行模式会据此规划并操作；仅规划模式只生成计划。",TextWrapping=TextWrapping.Wrap,Foreground=Brushes.DimGray,Margin=new Thickness(0,0,0,6)};
+    private readonly TextBox _message=new(){AcceptsReturn=true,TextWrapping=TextWrapping.Wrap,Height=72,VerticalScrollBarVisibility=ScrollBarVisibility.Auto,ToolTip="输入消息或回答 AI；长期目标在 LLM 交互调试窗口单独编辑。Enter 发送，Shift+Enter 换行"};
+    private readonly TextBlock _chatHint=new(){Text="普通聊天作为本次对话交给 AI。长期目标和完整交互过程可在“LLM 交互调试”中查看。Enter 发送，Shift+Enter 换行。",TextWrapping=TextWrapping.Wrap,Foreground=Brushes.DimGray,Margin=new Thickness(0,0,0,6)};
     private readonly TextBox _endpoint=new();private readonly TextBox _model=new();private readonly TextBox _gamePath=new();private readonly PasswordBox _key=new();
     private readonly ListBox _memories=new(){MinHeight=170,DisplayMemberPath="Display"};
     private readonly ComboBox _kind=new(){ItemsSource=new[]{"玩家约定","长期项目","工作经验","地点说明","每日摘要"},SelectedIndex=1};
@@ -32,22 +32,25 @@ public sealed class MainWindow:Window
     private readonly TextBox _chestName=new(){Text="工作箱"};private readonly TextBox _chestX=new(){Text="0"};private readonly TextBox _chestY=new(){Text="0"};private readonly TextBox _allowed=new(){Text="(O)388,(O)24"};private readonly TextBox _protected=new();
     private readonly TextBox _diagnostics=new(){IsReadOnly=true,AcceptsReturn=true,TextWrapping=TextWrapping.Wrap,VerticalScrollBarVisibility=ScrollBarVisibility.Auto};
     private readonly TextBox _plans=new(){IsReadOnly=true,AcceptsReturn=true,TextWrapping=TextWrapping.Wrap,VerticalScrollBarVisibility=ScrollBarVisibility.Auto};
+    private readonly PlanPreviewPanel _seasonPreview=new();
     private readonly DispatcherTimer _timer=new(){Interval=TimeSpan.FromSeconds(1)};
     private bool _closing;
     private bool _shutdownComplete;
     private bool _settingsLoaded;
     private Task? _initializing;
     private string _loadedScope="";
+    private DecisionMonitorWindow? _monitor;
     public MainWindow(string data,int? trialDays=null)
     {
         _data=data;_trialDays=trialDays;Title="星露谷 · AI 协同陪玩（开发预览）";Width=1100;Height=800;MinWidth=850;MinHeight=650;
         FontFamily=new FontFamily("Microsoft YaHei UI");FontSize=14;Background=new SolidColorBrush(Color.FromRgb(242,245,238));
         var root=new DockPanel{Margin=new Thickness(20)};Content=root;
         var title=new TextBlock{Text="一起经营这座农场",FontSize=25,FontWeight=FontWeights.SemiBold,Margin=new Thickness(0,0,0,14)};DockPanel.SetDock(title,Dock.Top);root.Children.Add(title);
-        var controls=new StackPanel{Orientation=Orientation.Horizontal,Margin=new Thickness(0,0,0,10)};
+        var controls=new WrapPanel{Margin=new Thickness(0,0,0,10)};
         controls.Children.Add(Button("暂停",()=>NeedRuntime().Pause()));controls.Children.Add(Button("继续",()=>NeedRuntime().Resume()));controls.Children.Add(Button("取消工作",()=>NeedRuntime().Cancel()));
         controls.Children.Add(Button("仅规划",()=>NeedRuntime().SetMode("plan_only")));controls.Children.Add(Button("自主执行",()=>NeedRuntime().SetMode("autonomous")));
         controls.Children.Add(Button("打开原版房主",()=>Launch(false)));controls.Children.Add(Button("打开 AI 客户端",()=>Launch(true)));
+        controls.Children.Add(Button("LLM 交互调试",()=>{OpenDecisionMonitor();return Task.CompletedTask;}));
         DockPanel.SetDock(controls,Dock.Top);root.Children.Add(controls);
         var state=new StackPanel{Margin=new Thickness(0,0,0,12)};state.Children.Add(_status);state.Children.Add(_startupHint);state.Children.Add(_world);DockPanel.SetDock(state,Dock.Top);root.Children.Add(state);
         var tabs=new TabControl();root.Children.Add(tabs);
@@ -58,6 +61,7 @@ public sealed class MainWindow:Window
         var composer=new DockPanel();composer.Children.Add(input);DockPanel.SetDock(input,Dock.Bottom);DockPanel.SetDock(_chatHint,Dock.Top);composer.Children.Add(_chatHint);DockPanel.SetDock(composer,Dock.Bottom);conversation.Children.Add(composer);conversation.Children.Add(_chat);
         _message.PreviewKeyDown+=(_,e)=>{if(e.Key==System.Windows.Input.Key.Enter&&(System.Windows.Input.Keyboard.Modifiers&System.Windows.Input.ModifierKeys.Shift)==0){e.Handled=true;_ = RunAction(SendChat);}};
         tabs.Items.Add(new TabItem{Header="中文聊天与工作",Content=conversation});
+        tabs.Items.Add(new TabItem{Header="季计划预览",Content=_seasonPreview});
         tabs.Items.Add(new TabItem{Header="工作记忆",Content=MemoryPanel()});
         tabs.Items.Add(new TabItem{Header="设置与工作箱",Content=SettingsPanel()});
         tabs.Items.Add(new TabItem{Header="诊断",Content=_diagnostics});
@@ -67,6 +71,13 @@ public sealed class MainWindow:Window
         _memories.SelectionChanged+=(_,_)=>{if(_memories.SelectedItem is MemoryEntry e)_memoryText.Text=e.Text;};
     }
     private CompanionRuntime NeedRuntime()=>_runtime??throw new InvalidOperationException("程序尚未就绪");
+    private void OpenDecisionMonitor()
+    {
+        NeedRuntime();
+        if(_monitor!=null){if(_monitor.WindowState==WindowState.Minimized)_monitor.WindowState=WindowState.Normal;_monitor.Activate();return;}
+        _monitor=new DecisionMonitorWindow(Path.Combine(_data,"session.json")){Owner=this};
+        _monitor.Closed+=(_,_)=>_monitor=null;_monitor.Show();
+    }
     private Button Button(string text,Func<Task> action)
     {
         var b=new Button{Content=text,Padding=new Thickness(14,7,14,7),Margin=new Thickness(0,0,8,0)};
@@ -171,6 +182,7 @@ public sealed class MainWindow:Window
         var runHint=_runtime.Mode=="plan_only"?"模型可立即规划。":_runtime.Running?"模型会按当前目标自主决策。":"当前已暂停；指令会排队，点“继续”后开始处理。";
         _chatHint.Text=$"当前模式：{modeHint}。{runHint}输入目标或补充要求后发送给 AI；Enter 发送，Shift+Enter 换行。";
         _plans.Text=JsonSerializer.Serialize(new{mode=_runtime.Mode,plans=_runtime.Plans},new JsonSerializerOptions{WriteIndented=true,Encoder=System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping});
+        var planning=_runtime.PlanningPreview;_seasonPreview.Update(planning);
         if(_loadedScope!=_runtime.Scope){_loadedScope=_runtime.Scope;LoadMemory();_chat.Clear();foreach(var h in _runtime.Memory.History(_loadedScope))_chat.AppendText($"{(h.Role=="user"?"玩家":"AI")}：{h.Text}\n\n");}
         _diagnostics.Text=JsonSerializer.Serialize(new{connected=_bridge.Connected,status=_runtime.Status,scope=_runtime.Scope,observation=s,decisionEvents=_runtime.Decisions.Read(Math.Max(0,_runtime.Decisions.Latest-30))},new JsonSerializerOptions{WriteIndented=true});
     }

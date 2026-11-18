@@ -114,26 +114,6 @@ public sealed partial class MemoryStore : IDisposable
     public IReadOnlyDictionary<string,int> EventSummary(string scope,string session,int day)
     {lock(_gate){using var c=Command("SELECT status,SUM(count) FROM events WHERE scope=$s AND session=$session AND day=$d AND valid=1 GROUP BY status",("$s",scope),("$session",session),("$d",day));using var r=c.ExecuteReader();var data=new Dictionary<string,int>();while(r.Read()){data[r.GetString(0)]=r.GetInt32(1);}return data;}}
     public void Chat(string scope, string role, string text) { lock (_gate) { using var c = Command("INSERT INTO chat(scope,role,text,at) VALUES($s,$r,$t,$a)", ("$s",scope),("$r",role),("$t",text),("$a",DateTime.UtcNow.ToString("O"))); c.ExecuteNonQuery(); } }
-    public string[] PlayerInstructions(string scope)
-    {
-        var stored=Get(scope,"player_instructions");
-        if(stored!=null)return (JsonSerializer.Deserialize<string[]>(stored)??Array.Empty<string>()).Where(ShouldPersistAsInstruction).ToArray();
-        // Upgrade old sessions without losing the original player request after chat truncation.
-        lock(_gate){using var c=Command("SELECT text FROM chat WHERE scope=$s AND role='user' ORDER BY id",("$s",scope));using var r=c.ExecuteReader();var rows=new List<string>();while(r.Read()){var text=r.GetString(0);if(ShouldPersistAsInstruction(text))rows.Add(text);}return rows.ToArray();}
-    }
-    public void AppendPlayerInstruction(string scope,string text)
-    {
-        if(!ShouldPersistAsInstruction(text))return;
-        var instructions=PlayerInstructions(scope).Append(text).ToArray();
-        Set(scope,"player_instructions",JsonSerializer.Serialize(instructions));
-    }
-    private static bool ShouldPersistAsInstruction(string text)
-    {
-        var value=text.Trim();
-        if(value.Length==0)return false;
-        if(value.Contains('?')||value.Contains('？')||value.Contains('¿'))return false;
-        return !System.Text.RegularExpressions.Regex.IsMatch(value,"^(为什么|为何|怎么|怎样|是否|能否|可否|请问|你能看到|你能不能).*(吗|呢|嘛)?$",System.Text.RegularExpressions.RegexOptions.CultureInvariant);
-    }
     public IReadOnlyList<(string Role, string Text)> History(string scope)
     { lock (_gate) { using var c = Command("SELECT role,text FROM (SELECT id,role,text FROM chat WHERE scope=$s ORDER BY id DESC LIMIT 20) ORDER BY id", ("$s",scope)); using var r=c.ExecuteReader(); var result=new List<(string,string)>(); while(r.Read()) result.Add((r.GetString(0),r.GetString(1))); return result; } }
     public long CreateProject(string scope,string goal,int day)

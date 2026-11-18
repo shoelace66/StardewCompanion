@@ -1,6 +1,7 @@
 using System.Text.Json;
 using StardewModdingAPI;
 using StardewValley;
+using StardewValley.Menus;
 
 namespace StardewCompanion.Mod;
 
@@ -23,10 +24,17 @@ internal static class GameEventTracker
         public int PassOutDay {get;set;}=-1;
         public int SleepRequestedDay {get;set;}=-1;
         public string[] Mail {get;set;}=Array.Empty<string>();
+        public string[] CapturedMail {get;set;}=Array.Empty<string>();
+        public string DialogueSignature {get;set;}="";
+        public string? DialogueTaskId {get;set;}
+        public string DialoguePromptId {get;set;}="";
+        public string DialogueHandling {get;set;}="";
         public List<Entry> Events {get;set;}=new();
     }
     private static string _directory="",_file="",_scope="";
     private static State _state=new();
+    internal static long DialogueRevision {get;private set;}
+    internal static (long Revision,bool Question,string Text)? LastDialogueCapture {get;private set;}
     internal static void Configure(string directory)=>_directory=Path.Combine(directory,"event-journal");
     private static bool Ensure()
     {
@@ -56,7 +64,39 @@ internal static class GameEventTracker
     {
         if(!Ensure())return;_state.SleepRequestedDay=(int)Game1.Date.TotalDays;Add("sleep_requested",new{source="accepted_native_Sleep_Yes"});
     }
-    internal static void Poll()
+    internal static void ObserveDialogue(string? activeTaskId,string? blockedTaskId,bool scriptWillAcknowledge)
+    {
+        if(!Ensure())return;
+        if(Game1.activeClickableMenu is not DialogueBox dialogue){ClearDialogue();return;}
+        var prompt=new{
+            type=dialogue.isQuestion?"choice":"notification",
+            text=dialogue.getCurrentString()??"",
+            question=dialogue.isQuestion,
+            questionKey=Game1.currentLocation.lastQuestionKey,
+            choices=dialogue.responses.Select(r=>new{responseKey=r.responseKey,text=r.responseText}).ToArray()
+        };
+        var signature=JsonSerializer.Serialize(prompt);
+        if(signature==_state.DialogueSignature)return;
+        _state.DialogueSignature=signature;
+        LastDialogueCapture=(++DialogueRevision,dialogue.isQuestion,dialogue.getCurrentString()??"");
+        _state.DialogueTaskId=activeTaskId;_state.DialoguePromptId=Guid.NewGuid().ToString("N");
+        _state.DialogueHandling=dialogue.isQuestion?"await_model_choice":scriptWillAcknowledge?"script_acknowledgement":"agent_dialogue_task";
+        Add("story_prompt",new{
+            promptId=_state.DialoguePromptId,promptRevision=DialogueRevision,
+            source="native_DialogueBox",
+            activeTaskId=string.IsNullOrWhiteSpace(activeTaskId)?null:activeTaskId,
+            blockedTaskId=string.IsNullOrWhiteSpace(blockedTaskId)?null:blockedTaskId,
+            handling=dialogue.isQuestion?"await_model_choice":scriptWillAcknowledge?"script_acknowledgement":"agent_dialogue_task",
+            prompt
+        });
+    }
+    internal static void ClearDialogue()
+    {
+        if(!Ensure()||_state.DialogueSignature=="")return;
+        Add("story_prompt_resolved",new{promptId=_state.DialoguePromptId,promptRevision=DialogueRevision,activeTaskId=_state.DialogueTaskId,handling=_state.DialogueHandling,resolved=true,requiresResponse=false});
+        _state.DialogueSignature="";_state.DialogueTaskId=null;_state.DialogueHandling="";Save();
+    }
+    internal static void Poll(string? activeTaskId=null)
     {
         if(!Ensure())return;
         var day=(int)Game1.Date.TotalDays;var mail=Game1.player.mailbox.ToArray();
@@ -64,10 +104,19 @@ internal static class GameEventTracker
         if(_state.Day>=0&&_state.Day!=day)Add("day_changed",new{previousDay=_state.Day,currentDay=day,
             cause=_state.PassOutDay==_state.Day?"pass_out":_state.SleepRequestedDay==_state.Day?"sleep":"unknown"});
         var added=mail.Except(_state.Mail).ToArray();
-        if(added.Length>0)Add("mail_arrived",new{unreadCount=mail.Length,canOpen=mail.Length>0,newMailIds=added,claimState="requires_native_mail_view"});
+        var alreadyCaptured=_state.CapturedMail.ToHashSet(StringComparer.Ordinal);
+        var unreadToCapture=mail.Where(id=>!alreadyCaptured.Contains(id)).ToArray();
+        if(unreadToCapture.Length>0){
+            var templates=Game1.content.Load<Dictionary<string,string>>("Data/mail");
+            var letters=unreadToCapture.Select(id=>new{id,
+                bodyAndAttachmentTemplate=templates.TryGetValue(id.Replace("%&NL&%",""),out var body)?body:null,
+                source="native_Data/mail_template",meaning="只读提取正文模板和附件指令，不会打开、标记已读或领取附件"}).ToArray();
+            Add("mail_arrived",new{activeTaskId=string.IsNullOrWhiteSpace(activeTaskId)?null:activeTaskId,unreadCount=mail.Length,
+                canOpen=mail.Length>0,newMailIds=added,readMailIds=unreadToCapture,letters,readOnly=true,claimState="requires_native_mail_view"});
+        }
         if(_state.FreeSlots>=0&&(_state.FreeSlots!=free||_state.Capacity!=capacity))Add("inventory_capacity_changed",new{capacity,freeSlots=free,previousFreeSlots=_state.FreeSlots});
-        var changed=_state.Day!=day||_state.FreeSlots!=free||_state.Capacity!=capacity||!mail.SequenceEqual(_state.Mail);
-        _state.Day=day;_state.FreeSlots=free;_state.Capacity=capacity;_state.Mail=mail;if(changed)Save();
+        var changed=_state.Day!=day||_state.FreeSlots!=free||_state.Capacity!=capacity||!mail.SequenceEqual(_state.Mail)||!mail.SequenceEqual(_state.CapturedMail);
+        _state.Day=day;_state.FreeSlots=free;_state.Capacity=capacity;_state.Mail=mail;_state.CapturedMail=mail;if(changed)Save();
     }
     internal static object[] Pending()=>_state.Events.Select(e=>(object)new{id=e.Id,type=e.Type,gameDay=e.Day,time=e.Time,facts=JsonSerializer.Deserialize<JsonElement>(e.Facts)}).ToArray();
     internal static void Acknowledge(string[] ids)

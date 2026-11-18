@@ -8,7 +8,10 @@ using System.Text;
 
 namespace StardewCompanion.Core;
 
-public sealed record ModelReply(string Text, JsonObject Message, JsonArray Calls, long ElapsedMs, string Usage);
+public sealed record ModelReply(string Text, JsonObject Message, JsonArray Calls, long ElapsedMs, string Usage)
+{
+    public string? FinishReason { get; init; }
+}
 public sealed class ModelClient(HttpClient http)
 {
     public async Task<ModelReply> Complete(ModelSettings settings, JsonArray messages, CancellationToken cancellation, JsonNode? toolChoice = null, bool soloTest=false,CapabilityStatus[]? capabilities=null,JsonArray? toolOverrides=null,Action<JsonObject>? capture=null,int maxTokens=2400)
@@ -18,6 +21,12 @@ public sealed class ModelClient(HttpClient http)
         if(availableTools.Count>0){body["tools"]=availableTools.DeepClone();body["tool_choice"]=toolChoice?.DeepClone()??JsonValue.Create("auto");}
         var payload=body.ToJsonString(DecisionContextCompression.ReadableJson);
         var timer=Stopwatch.StartNew();
+        // One budget covers the response body, retries and any transport fallback.
+        // A slow response must not start a second model generation.
+        using var requestTimeout=CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        requestTimeout.CancelAfter(TimeSpan.FromSeconds(45));
+        var requestCancellation=requestTimeout.Token;
+        try{
         for(var attempt=0;;attempt++){
         try{
         capture?.Invoke(body);
@@ -26,28 +35,23 @@ public sealed class ModelClient(HttpClient http)
         request.Headers.ConnectionClose=true;request.Headers.ExpectContinue=false;
         request.Headers.Authorization=new AuthenticationHeaderValue("Bearer",settings.GetKey());
         request.Content=new StringContent(payload,System.Text.Encoding.UTF8,"application/json");
-        using var attemptTimeout=CancellationTokenSource.CreateLinkedTokenSource(cancellation);attemptTimeout.CancelAfter(TimeSpan.FromSeconds(8));
-        using var response=await http.SendAsync(request,HttpCompletionOption.ResponseHeadersRead,attemptTimeout.Token);
+        using var response=await http.SendAsync(request,HttpCompletionOption.ResponseHeadersRead,requestCancellation);
         if(!response.IsSuccessStatusCode)throw new HttpRequestException($"模型请求失败（HTTP {(int)response.StatusCode}）",null,response.StatusCode);
-        var root=JsonNode.Parse(await response.Content.ReadAsStringAsync(attemptTimeout.Token))!;
-        var message=root["choices"]?[0]?["message"]?.AsObject()??throw new InvalidDataException("模型响应没有 message");
-        var calls=message["tool_calls"] as JsonArray??new JsonArray();
-        return new(message["content"]?.GetValue<string>()??"",message,calls,timer.ElapsedMilliseconds,root["usage"]?.ToJsonString()??"unavailable");
+        return ParseReply(await response.Content.ReadAsStringAsync(requestCancellation),timer);
         }
-        catch(TaskCanceledException ex)when(!cancellation.IsCancellationRequested){
-            if(OperatingSystem.IsWindows())return await CompleteViaWindowsPowerShell(settings,payload,timer,cancellation);
-            if(attempt<2){await Task.Delay(TimeSpan.FromSeconds(attempt+1),cancellation);continue;}
-            throw new TimeoutException("模型请求连续3次在8秒内未完成",ex);
+        catch(IOException)when(!requestCancellation.IsCancellationRequested&&OperatingSystem.IsWindows()){
+            return await CompleteViaWindowsPowerShell(settings,payload,timer,requestCancellation);
         }
-        catch(IOException)when(!cancellation.IsCancellationRequested&&OperatingSystem.IsWindows()){
-            return await CompleteViaWindowsPowerShell(settings,payload,timer,cancellation);
+        catch(HttpRequestException ex)when(!requestCancellation.IsCancellationRequested&&OperatingSystem.IsWindows()&&ex.StatusCode==null){
+            return await CompleteViaWindowsPowerShell(settings,payload,timer,requestCancellation);
         }
-        catch(HttpRequestException ex)when(!cancellation.IsCancellationRequested&&OperatingSystem.IsWindows()&&ex.StatusCode==null){
-            return await CompleteViaWindowsPowerShell(settings,payload,timer,cancellation);
+        catch(HttpRequestException ex)when(attempt<2&&!requestCancellation.IsCancellationRequested&&(ex.StatusCode==null||(int)ex.StatusCode==429||(int)ex.StatusCode>=500)){
+            await Task.Delay(TimeSpan.FromSeconds(attempt+1),requestCancellation);
         }
-        catch(HttpRequestException ex)when(attempt<2&&(ex.StatusCode==null||(int)ex.StatusCode==429||(int)ex.StatusCode>=500)){
-            await Task.Delay(TimeSpan.FromSeconds(attempt+1),cancellation);
         }
+        }
+        catch(OperationCanceledException ex)when(!cancellation.IsCancellationRequested){
+            throw new TimeoutException("模型请求在45秒总预算内未完成",ex);
         }
     }
 
@@ -75,10 +79,19 @@ public sealed class ModelClient(HttpClient http)
             if(output.StartsWith("ERR:",StringComparison.Ordinal))try{detail=JsonNode.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(output[4..])))?["error"]?.ToString()??detail;}catch(FormatException){}
             throw new HttpRequestException(detail);
         }
-        var root=JsonNode.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(output[3..])))!;
-        var message=root["choices"]?[0]?["message"]?.AsObject()??throw new InvalidDataException("模型响应没有 message");
+        return ParseReply(Encoding.UTF8.GetString(Convert.FromBase64String(output[3..])),timer);
+    }
+
+    private static ModelReply ParseReply(string body,Stopwatch timer)
+    {
+        var root=JsonNode.Parse(body)!;
+        var choice=root["choices"]?[0];
+        var message=choice?["message"]?.AsObject()??throw new InvalidDataException("模型响应没有 message");
         var calls=message["tool_calls"] as JsonArray??new JsonArray();
-        return new(message["content"]?.GetValue<string>()??"",message,calls,timer.ElapsedMilliseconds,root["usage"]?.ToJsonString()??"unavailable");
+        return new(message["content"]?.GetValue<string>()??"",message,calls,timer.ElapsedMilliseconds,root["usage"]?.ToJsonString()??"unavailable")
+        {
+            FinishReason=choice?["finish_reason"]?.ToString()
+        };
     }
 
     public async Task<ModelReply> TestToolCalling(ModelSettings settings, CancellationToken cancellation)
@@ -102,13 +115,21 @@ public static class ToolCatalog
     public static JsonArray SeasonMaintenanceDefinitions()=>new()
     {
         Tool("update_season_progress","只追加上一日已验证的游戏进度；不得修改季节计划固定字段",("progress","array","从已提供的成功工具回执中提炼的进度字符串数组")),
-        Tool("create_season_plan","在首个季节计划缺失时创建，或季节切换且上一季已核验后创建下一季计划",("season","string","当前观察中的季节名"),("goal","string","本季目标"),("constraints","array","锁定约束字符串数组"),("successCriteria","array","可由游戏状态与回执核验的成功条件字符串数组"),("progress","array","初始化进度字符串数组"),("previousSeasonReview","string","季末基于成功条件、累计进度与真实回执核验上一季的结果；首次创建时说明这是初始计划"))
+        RequiredPlanningDefinitions()[0]!.DeepClone()
+    };
+    public static JsonArray RequiredPlanningDefinitions()=>new()
+    {
+        Tool("create_season_plan","保存完整季计划；在任何游戏动作前必须完成，禁止缺省字段或空计划",("season","string","当前观察中的季节名"),("goal","string","覆盖玩家长期目标的本季目标"),("constraints","array","非空数组：必须遵守的玩家约束与资源限制"),("successCriteria","array","非空数组：可由游戏状态与回执核验的季末成功条件"),("milestones","array","非空数组：按日期或阶段安排的完整季度日程与关键节点"),("resourceStrategy","array","非空数组：资金周转、作物周期、体力和时间策略，明确假设与风险"),("progress","array","仅已核验的进度，首次允许空数组"),("previousSeasonReview","string","首次创建说明这是初始计划；重规划说明原因；换季时核验上一季结果")),
     };
     public static readonly HashSet<string> Queries=new(new[]{"observe","inspect_target","inspect_route","inspect_area","inspect_targets","read_mailbox"});
     public static readonly HashSet<string> Actions=new(new[]{"water_area","harvest_area","refill_water","forage_area","clear_area","till_area","plant_area","deposit_items","withdraw_items","go_to","follow_player","return_home","sleep","respond_dialogue","fish_at","fight_enemies","mine_travel"});
     public static readonly string[] TopLevelFrequentTools={"go_to","water_area","harvest_area","forage_area","sleep","clear_area","till_area","plant_area","deposit_items","withdraw_items"};
     public static void ValidateArguments(string name,JsonObject arguments)
     {
+        if(name=="go_to"){using var navigation=JsonDocument.Parse(arguments.ToJsonString());ContractValidation.ValidateNavigation(navigation.RootElement);}
+        if(BusinessCapabilities.Find(name) is {} business){
+            using var args=JsonDocument.Parse(arguments.ToJsonString());ContractValidation.Validate(business,args.RootElement);
+        }
         var definition=PrimitiveDefinitions().FirstOrDefault(t=>t?["function"]?["name"]?.ToString()==name)?["function"]?["parameters"]
             ??throw new InvalidOperationException("未注册的工具："+name);
         using var schema=JsonDocument.Parse(definition.ToJsonString());using var value=JsonDocument.Parse(arguments.ToJsonString());
@@ -120,7 +141,7 @@ public static class ToolCatalog
     private static JsonObject Tool(string name,string description,params (string Name,string Type,string Description)[] fields)
     {
         var props=new JsonObject();var required=new JsonArray();
-        foreach(var f in fields){props[f.Name]=Field(f.Type,f.Description);required.Add(f.Name);}
+        foreach(var f in fields){var publicName=BusinessCapabilities.PublicReferenceName(f.Name);props[publicName]=Field(f.Type,f.Description);required.Add(publicName);}
         return new(){["type"]="function",["function"]=new JsonObject{["name"]=name,["description"]=description,["parameters"]=new JsonObject{["type"]="object",["properties"]=props,["required"]=required,["additionalProperties"]=false}}};
     }
     public static JsonArray PrimitiveDefinitions(bool soloTest=false)
@@ -135,16 +156,16 @@ public static class ToolCatalog
             Tool("inspect_area","只读检查当前地图指定区域的地形、障碍和可达性",("location","string","地点标识"),("x","integer","左上横坐标"),("y","integer","左上纵坐标"),("width","integer","宽1到32"),("height","integer","高1到32")),
             Tool("read_context_history","按需读取当前存档的本地历史；不会操作游戏。plans空id列计划索引，指定id读步骤与回执；memory空id列记忆，指定id读原文；receipts指定任务id分页读处理格与掉落",("source","string","plans、memory、receipts或diagnostics"),("id","string","计划ID、记忆ID或任务ID；查询索引时为空字符串"),("offset","integer","从0开始的分页偏移"),("limit","integer","每页1到8项")),
             Tool("go_to","普通步行并自动跨地图到达最终地点和格子；location和坐标应是最终目的地，经过地图出口由导航处理，不要把当前地图exitTile作为中间目标（触发出口会立即切图）。collect=true时顺路拾取路径周围可见掉落物，单个掉落物拾取失败不会中断寻路",("location","string","最终目的地图标识；跨地图时直接填写目标地图"),("x","integer","最终地图中的到达横坐标"),("y","integer","最终地图中的到达纵坐标"),("collect","boolean","是否顺路采集，默认false"),("pickupRadius","integer","采集范围距实际A*路线的格数，0到8，默认2"),("breakNaturalObstacles","boolean","是否允许破坏自然障碍以缩短路径，由模型决定")),
-            Tool("respond_dialogue","读取当前弹窗后按明确选项继续；普通提示用空responseKey确认",("responseKey","string","必须是当前弹窗实际提供的responseKey；非选项提示填空字符串")),
+            Tool("respond_dialogue","读取当前弹窗后按明确选项继续；普通提示用空responseName确认",("responseKey","string","填写当前弹窗中显示的选项文字；非选项提示填空字符串")),
             Tool("fish_at","在指定岸边和抛竿方向连续钓鱼；本地控制原版鱼条，结果只按原版鱼获确认",("location","string","已观察的钓鱼地点机器标识"),("x","integer","玩家应站立的岸边格X"),("y","integer","玩家应站立的岸边格Y"),("direction","string","抛竿朝向"),("casts","integer","最多抛竿次数1到20"),("treasurePolicy","string","try或ignore，由模型选择是否争取宝箱")),
-            Tool("fight_enemies","在当前普通矿井连续战斗，按原版武器碰撞与怪物状态核验；不自动吃食物或撤退",("maxKills","integer","击杀目标数1到30"),("maxGameMinutes","integer","游戏时间上限1到600"),("weaponId","string","明确使用的武器QualifiedItemId")),
+            Tool("fight_enemies","在当前普通矿井连续战斗，按原版武器碰撞与怪物状态核验；不自动吃食物或撤退",("maxKills","integer","击杀目标数1到30"),("maxGameMinutes","integer","游戏时间上限1到600"),("weaponId","string","背包中明确使用的武器名称")),
             Tool("mine_travel","在普通矿井入口、电梯或已出现梯子间通行；不挖矿、不生成梯子、不自动战斗",("targetFloor","integer","目标普通矿井楼层0到120；0表示离开矿井")),
-            Tool("follow_player","跟随联机玩家，在不支持地图外等待",("playerId","string","玩家机器标识")),
+            Tool("follow_player","跟随联机玩家，在不支持地图外等待",("playerId","string","当前已连接玩家的显示名称")),
             Tool("refill_water","在当前地图寻找可达水源补水"),Tool("return_home","步行回自己的小屋"),Tool("sleep","自动从当前位置步行回自己的农舍、前往床并等待原版换日；无需先单独调用return_home或go_to"),
             Tool("cancel_task","取消当前任务，不代表批准任何请求"),
             Tool("ask_user","仅缺少必要授权或观察与记忆均无法取得关键信息时询问；已授权的日常经营自行选择；未回答不代表批准",("question","string","中文问题")),
             Tool("remember_experience","记录可复用的工作经验，包括条件、依据和下一步",("text","string","条件、经验、来源及下一步核验")),
-            Tool("update_project","更新项目下一步建议",("projectId","string","项目机器 ID"),("nextStep","string","基于当前观察的下一步建议"))
+            Tool("update_project","更新项目下一步建议",("projectId","string","项目目标名称"),("nextStep","string","基于当前观察的下一步建议"))
         };
         var goTo=a.First(t=>t?["function"]?["name"]?.GetValue<string>()=="go_to");
         goTo!["function"]!["parameters"]!["properties"]!["breakNaturalObstacles"]=new JsonObject{["type"]="boolean",["description"]="是否允许为缩短路程破坏自然枝条、石块、杂草、野树或草；会消耗工具耐久/体力并掉落物品，由模型决定"};
@@ -157,9 +178,9 @@ public static class ToolCatalog
         }
         a.Add(Tool("clear_area","按类型连续清除指定区域的自然障碍，并按真实状态验收",("location","string","地点标识"),("x","integer","左上横坐标"),("y","integer","左上纵坐标"),("width","integer","宽1到32"),("height","integer","高1到32"),("targetType","string","障碍类型")));
         a.Add(Tool("till_area","将指定区域的可耕空地锄成耕地，不播种",("location","string","地点标识"),("x","integer","左上横坐标"),("y","integer","左上纵坐标"),("width","integer","宽1到32"),("height","integer","高1到32")));
-        a.Add(Tool("plant_area","在指定区域已有的空耕地播种指定种子",("location","string","地点标识"),("x","integer","左上横坐标"),("y","integer","左上纵坐标"),("width","integer","宽1到32"),("height","integer","高1到32"),("seedId","string","背包种子QualifiedItemId")));
+        a.Add(Tool("plant_area","在指定区域已有的空耕地播种指定种子",("location","string","地点标识"),("x","integer","左上横坐标"),("y","integer","左上纵坐标"),("width","integer","宽1到32"),("height","integer","高1到32"),("seedId","string","背包中种子的名称")));
         foreach(var name in new[]{"deposit_items","withdraw_items"})
-            a.Add(Tool(name,"自动步行到指定的玩家授权工作箱、打开并按堆叠批量存取明确数量；保护物品不能转移",("chest","string","已授权工作箱名称"),("itemId","string","物品机器标识，如 (O)388"),("count","integer","数量1到9999")));
+            a.Add(Tool(name,"自动步行到指定的玩家授权工作箱、打开并按堆叠批量存取明确数量；保护物品不能转移",("chest","string","已授权工作箱名称"),("itemId","string","物品的显示名称"),("count","integer","数量1到9999")));
         foreach(var tool in a)if(tool?["function"]?["name"]?.GetValue<string>() is "clear_area" or "till_area" or "plant_area"){
             tool["function"]!["parameters"]!["properties"]!["width"]!["maximum"]=32;
             tool["function"]!["parameters"]!["properties"]!["height"]!["maximum"]=32;
@@ -177,7 +198,13 @@ public static class ToolCatalog
             foreach(var coordinate in new[]{"x","y"})if(props[coordinate]!=null)props[coordinate]!["minimum"]=0;
             if(name.EndsWith("_area"))foreach(var dimension in new[]{"width","height"}){props[dimension]!["minimum"]=1;props[dimension]!["maximum"]=32;props[dimension]!["description"]="区域尺寸1到32格";}
             if(name=="go_to"){
-                var required=f["parameters"]!["required"]!.AsArray();foreach(var key in new[]{"collect","pickupRadius","breakNaturalObstacles"})required.Remove(required.First(v=>v!.ToString()==key));
+                f["description"]="步行到location指定地图（可选x/y），或按name准确名字寻找地图、NPC或授权工作箱；脚本实时定位NPC并跟随其地图变化，无需预先观察。name可带location消歧，不触发对话或开箱。未知或同名返回原因和候选。可顺路拾取。";
+                f["parameters"]!["required"]=new JsonArray();
+                props["location"]!["description"]="目标机器地图名；按name找目标时可选，用于消歧";
+                props["name"]=new JsonObject{["type"]="string",["minLength"]=1,["description"]="准确地图名称、NPC姓名或授权工作箱名；与x/y互斥"};
+                f["parameters"]!["oneOf"]=new JsonArray(
+                    new JsonObject{["type"]="object",["properties"]=new JsonObject{["name"]=props["name"]!.DeepClone()},["required"]=new JsonArray("name")},
+                    new JsonObject{["type"]="object",["properties"]=new JsonObject{["location"]=props["location"]!.DeepClone(),["name"]=new JsonObject{["type"]="null"}},["required"]=new JsonArray("location")});
                 props["collect"]!["default"]=false;props["pickupRadius"]!["default"]=2;props["pickupRadius"]!["minimum"]=0;props["pickupRadius"]!["maximum"]=8;props["breakNaturalObstacles"]!["default"]=false;
             }
             if(name=="fish_at"){
@@ -223,6 +250,10 @@ public static class ToolCatalog
         tools.Add(Tool("wait_for_change","没有有效工作时等待状态变化或到期",("seconds","integer","1到120秒"),("reason","string","明确等待什么条件")));
         tools.Last()!["function"]!["parameters"]!["properties"]!["seconds"]!["minimum"]=1;
         tools.Last()!["function"]!["parameters"]!["properties"]!["seconds"]!["maximum"]=120;
+        tools.Last()!["function"]!["parameters"]!["properties"]!["expectedChange"]=new JsonObject{["type"]="string",
+            ["enum"]=new JsonArray("meaningful_state","time_of_day","day_changed","inventory_changed","shop_opened"),
+            ["description"]="可选；默认meaningful_state忽略时钟和位置微变。time_of_day必须给targetTime；shop_opened只认当前地图实际出现ShopMenu，不推测营业时间"};
+        tools.Last()!["function"]!["parameters"]!["properties"]!["targetTime"]=new JsonObject{["type"]="integer",["minimum"]=0,["maximum"]=2600,["description"]="time_of_day等待的HHMM游戏时间，例如900；预计开店时间只表示到点重新检查"};
         tools.Add(new JsonObject{["type"]="function",["function"]=new JsonObject{["name"]="inspect_targets",["description"]="一次检查当前地图1到32格，避免逐格模型往返",
             ["parameters"]=new JsonObject{["type"]="object",["properties"]=new JsonObject{["tiles"]=new JsonObject{["type"]="array",["minItems"]=1,["maxItems"]=32,["items"]=new JsonObject{["type"]="object",["properties"]=new JsonObject{["x"]=Field("integer","tile coordinate"),["y"]=Field("integer","tile coordinate")},["required"]=new JsonArray("x","y"),["additionalProperties"]=false}}},["required"]=new JsonArray("tiles"),["additionalProperties"]=false}}});
         return tools;

@@ -23,7 +23,7 @@ internal static class BusinessAvailability
         "collect_daily_info" or "visit_villagers" or "manage_quests" or "donate_bundle" or "donate_museum" or "attend_event";
     internal static object Survey(JsonElement args)
     {
-        if(args.GetProperty("location").GetString()!=Game1.currentLocation.NameOrUniqueName)return new{status="blocked",reason="requires_current_observed_location"};
+        if(args.GetProperty("location").GetString()!=Game1.currentLocation.NameOrUniqueName)return new{status="blocked",reason="requires_current_observed_location",requestedLocation=args.GetProperty("location").GetString(),currentLocation=Game1.currentLocation.NameOrUniqueName};
         var l=Game1.currentLocation;var cells=new List<object>();var x=args.GetProperty("x").GetInt32();var y=args.GetProperty("y").GetInt32();
         var width=args.GetProperty("width").GetInt32();var height=args.GetProperty("height").GetInt32();
         for(var xx=x;xx<x+width;xx++)for(var yy=y;yy<y+height;yy++){

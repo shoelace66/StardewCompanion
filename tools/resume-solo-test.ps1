@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$RunRoot='', [string]$GamePath='F:\SteamLibrary\steamapps\common\Stardew Valley',[switch]$RestartGoal,[switch]$ResetAgentMemory)
+param([string]$RunRoot='', [string]$GamePath='F:\SteamLibrary\steamapps\common\Stardew Valley',[switch]$RestartGoal,[switch]$ResetAgentMemory,[string]$InitialInstructionFile='',[string]$SettingsFile='')
 $ErrorActionPreference='Stop'
 $repo=Split-Path -Parent $PSScriptRoot
 $currentPath=Join-Path $repo '.local/solo5-current.json'
@@ -7,9 +7,19 @@ $current=Get-Content -LiteralPath $currentPath -Raw|ConvertFrom-Json
 if(-not $RunRoot){$RunRoot=$current.runRoot}
 $RunRoot=[IO.Path]::GetFullPath($RunRoot)
 $runId=Split-Path -Leaf $RunRoot
+if($RestartGoal){
+ if([string]::IsNullOrWhiteSpace($InitialInstructionFile)){throw 'Replacing a goal requires -InitialInstructionFile'}
+ $InitialInstructionFile=[IO.Path]::GetFullPath($InitialInstructionFile)
+ if(-not(Test-Path -LiteralPath $InitialInstructionFile -PathType Leaf)){throw 'Initial instruction file was not found'}
+}
 $world=Get-Content -LiteralPath (Join-Path $RunRoot 'world.json') -Raw|ConvertFrom-Json
 $trial=Get-Content -LiteralPath (Join-Path $RunRoot 'trial.json') -Raw|ConvertFrom-Json
 if($world.runId -ne $runId -or $current.runId -ne $runId){throw 'Resume identity does not match the recorded run'}
+$runSettings=Join-Path $RunRoot 'model.credentials.json'
+if($SettingsFile){$SettingsFile=[IO.Path]::GetFullPath($SettingsFile)}else{$SettingsFile=$runSettings}
+if(-not(Test-Path -LiteralPath $SettingsFile -PathType Leaf)){throw 'Original model settings are missing; specify -SettingsFile explicitly to restore this older run'}
+$configured=Get-Content -LiteralPath $SettingsFile -Raw|ConvertFrom-Json
+if([string]::IsNullOrWhiteSpace([string]$configured.Model)-or[string]::IsNullOrWhiteSpace([string]$configured.ApiKeyDpapi)){throw 'Resume requires configured model settings'}
 $save=[IO.Path]::GetFullPath($world.folder)
 $savesRoot=[IO.Path]::GetFullPath((Join-Path $env:APPDATA 'StardewValley/Saves'))
 if(-not $save.StartsWith($savesRoot.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Save folder is outside the native saves directory'}
@@ -36,6 +46,7 @@ $backup=Join-Path $repo ('.local/solo-resume-backups/'+$runId+'/'+$stamp)
 New-Item -ItemType Directory -Path $backup -Force|Out-Null
 Copy-Item -LiteralPath $save -Destination (Join-Path $backup 'native-save') -Recurse
 Copy-Item -LiteralPath $RunRoot -Destination (Join-Path $backup 'agent-data') -Recurse
+if(-not [string]::Equals($SettingsFile,$runSettings,[StringComparison]::OrdinalIgnoreCase)){Copy-Item -LiteralPath $SettingsFile -Destination $runSettings -Force}
 if($ResetAgentMemory){
  $memoryArchive=Join-Path $backup 'retired-memory'
  New-Item -ItemType Directory -Path $memoryArchive -Force|Out-Null
@@ -50,14 +61,13 @@ foreach($project in @('src/StardewCompanion.Diagnostics/StardewCompanion.Diagnos
  if($LASTEXITCODE -ne 0){throw ('Resume build failed: '+$project)}
 }
 $mods=Join-Path $RunRoot 'Mods'
-foreach($file in @('StardewCompanion.Mod.dll','StardewCompanion.Protocol.dll','manifest.json')){Copy-Item -LiteralPath (Join-Path $repo ('src/StardewCompanion.Mod/bin/Release/net6.0/'+$file)) -Destination (Join-Path $mods 'StardewCompanion.Bridge') -Force}
-foreach($file in @('Fixture.dll','StardewCompanion.Protocol.dll','manifest.json')){Copy-Item -LiteralPath (Join-Path $repo ('tools/Fixture/bin/Release/net6.0/'+$file)) -Destination (Join-Path $mods 'SoloFiveDayFixture') -Force}
+& (Join-Path $PSScriptRoot 'stage-solo-mods.ps1') -ModsPath $mods
 $sessionPath=Join-Path $RunRoot 'session.json'
 $backend=[Diagnostics.ProcessStartInfo]::new()
 $backend.FileName=$dotnet;$backend.Arguments='"'+(Join-Path $repo 'src/StardewCompanion.Diagnostics/bin/Release/net10.0/StardewCompanion.Diagnostics.dll')+'" --agent --trial-days '+$trial.trialDays
 $backend.UseShellExecute=$false;$backend.CreateNoWindow=$true;$backend.WindowStyle='Hidden';$backend.WorkingDirectory=$repo
 $backend.EnvironmentVariables['SC_SESSION_FILE']=$sessionPath;$backend.EnvironmentVariables['SC_AGENT_DATA']=$RunRoot
-$backend.EnvironmentVariables['SC_MODEL_SETTINGS']=Join-Path $repo '.local/model.credentials.json'
+$backend.EnvironmentVariables['SC_MODEL_SETTINGS']=$runSettings
 $newService=[Diagnostics.Process]::Start($backend)
 $deadline=[DateTime]::UtcNow.AddSeconds(20)
 do{
@@ -78,7 +88,7 @@ $evidence=Join-Path $repo '.local/business-validation.json'
 if(Test-Path -LiteralPath $evidence){$game.EnvironmentVariables['SC_BUSINESS_EVIDENCE']=$evidence}
 $client=[Diagnostics.Process]::Start($game)
 $watch=[Diagnostics.ProcessStartInfo]::new();$watch.FileName='powershell.exe'
-$watch.Arguments='-NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $PSScriptRoot 'watch-solo-autonomy.ps1')+'" -RunRoot "'+$RunRoot+'" -Days '+$trial.trialDays+' -Resume'+$(if($RestartGoal){' -RestartGoal'}else{''})
+$watch.Arguments='-NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $PSScriptRoot 'watch-solo-autonomy.ps1')+'" -RunRoot "'+$RunRoot+'" -Days '+$trial.trialDays+' -Resume'+$(if($RestartGoal){' -RestartGoal -InitialInstructionFile "'+$InitialInstructionFile+'"'}else{''})
 $watch.UseShellExecute=$false;$watch.CreateNoWindow=$true;$watch.WindowStyle='Hidden';$watch.WorkingDirectory=$repo
 $watcher=[Diagnostics.Process]::Start($watch)
 @{runId=$runId;runRoot=$RunRoot;servicePid=$newService.Id;gamePid=$client.Id;watcherPid=$watcher.Id;sessionFile=$sessionPath;trialDays=$trial.trialDays;resumedAt=[DateTimeOffset]::Now.ToString('o');backup=$backup}|ConvertTo-Json|Set-Content -LiteralPath $currentPath -Encoding UTF8

@@ -45,7 +45,7 @@ await UntilAsync(async () =>
 }, "observation roundtrip");
 
 var taskId = Guid.NewGuid().ToString("N");
-var taskResponse = await http.PostAsJsonAsync("/task", new { skill = "walk", arguments = new { direction = "right", milliseconds = 300 }, taskId });
+var taskResponse = await http.PostAsJsonAsync("/task", new { skill = "go_to", arguments = new { location = "Farm", x = 1, y = 1 }, taskId });
 Assert(taskResponse.StatusCode == HttpStatusCode.Accepted, "task dispatch returns accepted, not completed");
 var received = await Read("task");
 var command = JsonSerializer.Deserialize<TaskCommand>(received.Payload)!;

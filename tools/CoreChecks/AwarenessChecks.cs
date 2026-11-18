@@ -39,8 +39,6 @@ internal static class AwarenessChecks
             Check(captures.Length==sent.Length&&captures.Select((e,i)=>JsonNode.Parse(e.Data.GetProperty("prompt").GetRawText())!.ToJsonString()==sent[i].ToJsonString()).All(x=>x),"every successful or failed request capture equals the complete actual HTTP JSON body");
             Check(captures.All(e=>!e.Data.GetRawText().Contains("secret-must-not-be-captured")&&e.Data.GetProperty("prompt").TryGetProperty("max_tokens",out _)),"captures include model parameters and exclude authorization secrets");
             bridge.EventIds=new[]{"mail-2"};bridge.Publish();
-            runtime.Memory.AppendPlayerInstruction(runtime.Scope,"为什么不去社交一下？");
-            Check(!runtime.Memory.PlayerInstructions(runtime.Scope).Any(x=>x.Contains("为什么")),"ordinary chat questions are not persisted as instructions");
             bridge.Observation!.GameDay++;bridge.Publish();
             Check(runtime.Memory.Get(runtime.Scope,"season_maintenance")!.Contains("spring"),"sleep maintenance resolves the actual decisionFacts.calendar.season path");
         }
@@ -61,8 +59,6 @@ internal static class AwarenessChecks
             bridge.Observation!.SaveId="other-save";bridge.EventIds=Array.Empty<string>();bridge.Publish();
             Check(restored.AwarenessSnapshot()["pendingEvents"]!.AsArray().Count==0,"event queues are isolated by save and farmer");
         }
-        var compressed=DecisionContextCompression.Build(new JsonObject{["actionFeedback"]=new JsonObject{["reason"]="inventory_full"},["gameEvents"]=new JsonArray(new JsonObject{["type"]="mail_arrived"}),["instruction"]=new string('x',500)},1);
-        Check(compressed.OverBudget&&compressed.Context["actionFeedback"]!=null&&compressed.Context["gameEvents"]!=null,"compression never drops current feedback or events even when over budget");
     }
     static JsonNode Context(JsonObject request)=>JsonNode.Parse(request["messages"]!.AsArray().First(m=>m?["role"]?.ToString()=="user")!["content"]!.GetValue<string>())!;
     sealed class CaptureModel:HttpMessageHandler

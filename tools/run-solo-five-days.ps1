@@ -18,7 +18,14 @@ function View {((State).WorldView|ConvertFrom-Json)}
 function Record($kind,$data){[IO.File]::AppendAllText($journalPath,((@{at=[DateTimeOffset]::Now.ToString('o');kind=$kind;data=$data}|ConvertTo-Json -Depth 18 -Compress)+[Environment]::NewLine),[Text.UTF8Encoding]::new($false))}
 function Status($phase,$data){@{at=[DateTimeOffset]::Now.ToString('o');runId=$runId;phase=$phase;details=$data}|ConvertTo-Json -Depth 18|Set-Content -LiteralPath $statusPath -Encoding UTF8;Write-Output $phase}
 function RunTask([string]$skill,$arguments,[int]$timeout=120,[switch]$AllowPartial,[switch]$OptionalResource){
- $state=State;$id=[Guid]::NewGuid().ToString('N');Record 'dispatch' @{day=$state.GameDay;time=$state.TimeOfDay;taskId=$id;skill=$skill;arguments=$arguments}
+ $state=State
+ if($skill -ne 'respond_dialogue' -and $state.Menu -eq 'DialogueBox'){
+  $dialogue=$state.MenuContext|ConvertFrom-Json
+  if($dialogue.question){throw ('Unanswered game question requires an explicit choice: '+($dialogue.choices|ConvertTo-Json -Compress))}
+  $null=RunTask 'respond_dialogue' @{responseKey=''}
+  $state=State
+ }
+ $id=[Guid]::NewGuid().ToString('N');Record 'dispatch' @{day=$state.GameDay;time=$state.TimeOfDay;taskId=$id;skill=$skill;arguments=$arguments}
  $null=Request 'task' @{skill=$skill;arguments=$arguments;taskId=$id};$deadline=[DateTime]::UtcNow.AddSeconds($timeout);$result=$null
  do{$all=Request 'results';$result=$all|Where-Object {$_.TaskId -eq $id -and $_.Status -in @('completed','partial','failed','cancelled','rejected')}|Select-Object -Last 1;if($result){break};Start-Sleep -Milliseconds 200}while([DateTime]::UtcNow -lt $deadline)
  if(-not $result){throw "Task timed out: $skill ($id)"};Record 'result' $result;$tasks.Add($result)
@@ -82,7 +89,7 @@ try{
   Record 'continued_after_fix' @{gameDay=$startDay;priorVerifiedDays=$days.Count}
  }elseif($state.GameDay -ne 0){throw 'This runner starts only on spring day 1 of a new farm'}
  $null=Request 'resume' @{}
- if(-not $Continue){$starter=RunTask 'collect_starter_seeds' @{};if($starter.Completed -ne 15){throw 'The normal 15 starter seeds were not received'}}
+ if(-not $Continue){$starter=RunTask 'claim_starter_gift' @{};if($starter.Completed -ne 15){throw 'The normal 15 starter seeds were not received'}}
  for($day=$startDay;$day -lt 5;$day++){
   $state=State;if($state.GameDay -ne $day){throw 'Unexpected game date; refusing to skip or replay an opening day'}
   Status ('day_'+($day+1)+'_working') @{day=$day;stamina=$state.Stamina;money=(View).money}

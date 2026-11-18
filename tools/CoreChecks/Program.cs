@@ -10,8 +10,12 @@ using StardewCompanion.Protocol;
 using StardewCompanion.Fishing;
 
 var root=Path.GetFullPath(args.FirstOrDefault()??".");
+if(args.Contains("--continuation")){await PlanChecks.RunContinuation(Path.Combine(root,".local","checks",Guid.NewGuid().ToString("N")));return;}
 if(args.Contains("--awareness")){await AwarenessChecks.Run(Path.Combine(root,".local","checks","awareness-"+DateTime.UtcNow.ToString("yyyyMMddHHmmss")));return;}
 if(args.Contains("--season-tools")){await SeasonToolChecks.Run(Path.Combine(root,".local","checks",Guid.NewGuid().ToString("N")));return;}
+if(args.Contains("--decision-quality")){await DecisionQualityChecks.Run(Path.Combine(root,".local","checks",Guid.NewGuid().ToString("N")));return;}
+if(args.Contains("--decision-tool-scope")){await DecisionQualityChecks.RunToolScope(Path.Combine(root,".local","checks",Guid.NewGuid().ToString("N")));return;}
+if(args.Contains("--offline-interaction")){await OfflineInteractionChecks.Run(Path.Combine(root,".local","checks",Guid.NewGuid().ToString("N")));return;}
 if(args.Contains("--live"))
 {
     var settings=ModelSettings.Load(Path.Combine(root,".local","model.credentials.json"));
@@ -60,17 +64,17 @@ using(var db=new MemoryStore(path))
 }
 using(var db=new MemoryStore(path))Assert(db.Get("a:1","paused")=="true"&&db.List("a:1").Any(m=>m.State=="cancelled"),"pause and cancellation survive reopening");
 var chest=new ChestBinding("工作箱","bound","Farm",1,2,new[]{"(O)388","(T)Axe"},new[]{"(O)24"});
-var observation=new GameObservation{WorldReady=true,SessionId="session",SaveId="save",PlayerId=2,Revision=10,GameDay=1,Location="Farm",WorldView="{\"maxStamina\":270}",Stamina=270,Health=100,TimeOfDay=900};
+var observation=new GameObservation{WorldReady=true,SessionId="session",SaveId="save",PlayerId=2,Revision=10,GameDay=1,Location="Farm",WorldView="{\"maxStamina\":270,\"inventory\":[{\"id\":\"(O)388\",\"name\":\"Stone\"},{\"id\":\"(T)Axe\",\"name\":\"Axe\"}]}",Stamina=270,Health=100,TimeOfDay=900};
 var soloState=JsonSerializer.Deserialize<GameObservation>(JsonSerializer.Serialize(observation))!;soloState.IsHost=true;
 Assert(!ControlModePolicy.CanControl(soloState),"ordinary host remains outside the controlled farmhand boundary");
 soloState.ControlMode="solo_test";soloState.TestRunId="SC5D_check";soloState.PlayerName="SC5Host";
 Assert(ControlModePolicy.CanControl(soloState),"explicit isolated solo test host can be controlled");
 soloState.Multiplayer=true;Assert(!ControlModePolicy.CanControl(soloState),"solo test opt-in cannot authorize a multiplayer host");
 soloState.Multiplayer=false;soloState.TestRunId="real-farm";Assert(!ControlModePolicy.CanControl(soloState),"normal saves cannot be opted into solo test control");
-Reject(()=>PermissionPolicy.Authorize("deposit_items",new JsonObject{["chest"]="工作箱",["itemId"]="(O)388",["count"]=2,["chestId"]="forged"},new[]{chest},observation),"model cannot inject an internal chest binding");
-var authorized=PermissionPolicy.Authorize("deposit_items",new JsonObject{["chest"]="工作箱",["itemId"]="(O)388",["count"]=2},new[]{chest},observation);
+Reject(()=>PermissionPolicy.Authorize("deposit_items",new JsonObject{["chest"]="工作箱",["itemName"]="Stone",["count"]=2,["chestId"]="forged"},new[]{chest},observation),"model cannot inject an internal chest binding");
+var authorized=PermissionPolicy.Authorize("deposit_items",new JsonObject{["chest"]="工作箱",["itemName"]="Stone",["count"]=2},new[]{chest},observation);
 Assert(authorized["chestId"]!.GetValue<string>()=="bound","authorized chest name resolves to the player binding");
-Reject(()=>PermissionPolicy.Authorize("withdraw_items",new JsonObject{["chest"]="工作箱",["itemId"]="(T)Axe",["count"]=1},new[]{chest},observation),"tool protection overrides allowlist");
+Reject(()=>PermissionPolicy.Authorize("withdraw_items",new JsonObject{["chest"]="工作箱",["itemName"]="Axe",["count"]=1},new[]{chest},observation),"tool protection overrides allowlist");
 Reject(()=>PermissionPolicy.Authorize("sell_items",new(),new[]{chest},observation),"business mutation with missing required arguments rejected");
 
 var builder=WebApplication.CreateBuilder();builder.Logging.ClearProviders();builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -172,10 +176,14 @@ await using(var isolated=new CompanionRuntime(isolatedBridge,new MemoryStore(Pat
     Assert(!scenarioRequests.Any(body=>body["messages"]!.AsArray().Any(m=>m?["role"]?.GetValue<string>()=="user"&&m["content"]!.GetValue<string>().Contains("旧存档不能带入的新指令"))),"queued player instructions are discarded when save or session changes");
     Assert(isolated.Memory.History("save:2").Single().Text=="旧存档不能带入的新指令"&&isolated.Memory.History("another-save:2").Count==0,"discarded instructions remain only in their original save's chat history");
 }
-await ContextChecks.Run(root,folder);
+ContextChecks.Run(folder);
 await PlanChecks.Run(folder);
+await PlanChecks.RunContinuation(Path.Combine(folder,"continuation"));
 await AwarenessChecks.Run(Path.Combine(folder,"awareness"));
 await SeasonToolChecks.Run(folder);
+await DecisionQualityChecks.Run(folder);
+await DecisionQualityChecks.RunToolScope(Path.Combine(folder,"tool-scope"));
+await OfflineInteractionChecks.Run(Path.Combine(folder,"offline-interaction"));
 await server.StopAsync();
 Console.WriteLine("All core checks passed; live game behavior is tested separately.");
 

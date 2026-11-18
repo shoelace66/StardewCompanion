@@ -15,6 +15,7 @@ internal sealed class AreaActionExecutor
     private readonly string _skill;
     private readonly JsonElement _args;
     private readonly Action<GridPoint> _interact;
+    private readonly ExecutionClock _clock=new();
     private readonly Navigation _nav=new();
     private readonly HashSet<GridPoint> _done=new();
     private readonly Dictionary<string,int> _initial=Inventory();
@@ -22,10 +23,21 @@ internal sealed class AreaActionExecutor
     private long _wait;
     private long _pickupDeadline;
     private int _hits;
+    private bool _targetVerified;
     private int _seedBefore;
     private float _beforeHealth;
     private bool _disposed;
-    private readonly HashSet<Debris> _oldDebris=Game1.currentLocation.debris.ToHashSet();
+    private HashSet<Debris>? _oldDebris;
+    private readonly HashSet<Debris> _taskDrops=new();
+    private long _settleUntil;
+    private IEnumerable<Debris> PendingTaskDrops()=>Game1.currentLocation.NameOrUniqueName==Map?Game1.currentLocation.debris.Where(d=>_taskDrops.Contains(d)&&(d.item!=null||!string.IsNullOrEmpty(d.itemId.Value))):Enumerable.Empty<Debris>();
+    internal object[] RemainingDrops()=>PendingTaskDrops().Select(d=>(object)new{location=Map,id=d.item?.QualifiedItemId??d.itemId.Value,count=d.item?.Stack??d.Chunks.Count,chunks=d.Chunks.Select(c=>new{x=c.position.X,y=c.position.Y}).ToArray(),reason=Reason}).ToArray();
+    private void TrackDrops(){
+        if(Game1.currentLocation.NameOrUniqueName!=Map)return;
+        _oldDebris??=Game1.currentLocation.debris.ToHashSet();
+        if(_target is not {} target)return;
+        foreach(var drop in Game1.currentLocation.debris.Where(d=>!_oldDebris.Contains(d)&&d.Chunks.Any(c=>Vector2.DistanceSquared(c.position.Value,new Vector2(target.X*64,target.Y*64))<=512*512)))_taskDrops.Add(drop);
+    }
     internal int Completed {get;private set;}
     internal string Phase {get;private set;}="starting";
     internal string Reason {get;private set;}="";
@@ -84,14 +96,17 @@ internal sealed class AreaActionExecutor
             if(_skill=="plant_area"&&Soil(p) is {crop:null} soil&&soil.canPlantThisSeedHere(ItemRegistry.GetDataOrErrorItem(SeedId).ItemId))yield return p;
         }
     }
+    internal void SuspendForStoryPrompt(){_clock.Pause();_nav.Suspend();}
     internal string Tick(AiInputSimulator input)
     {
+        _clock.Resume();
         if(_disposed)return End("area_action_cancelled");
         Capture();
         if(Game1.activeClickableMenu!=null)return End("unexpected_menu:"+Game1.activeClickableMenu.GetType().Name);
         if(Game1.eventUp||!Game1.player.CanMove||Game1.player.UsingTool){_nav.Suspend();Phase="waiting_for_native_game";return "running";}
         if(Game1.currentLocation.NameOrUniqueName!=Map){var travel=_nav.Move(Map,new GridPoint(Num("x"),Num("y")),input,_interact);Phase="travel_to_area";return travel is "blocked" or "unsupported"?End(_nav.Reason):"running";}
-        var now=Environment.TickCount64;
+        TrackDrops();
+        var now=_clock.Now;
         if(_target is {} target&&_wait!=0)
         {
             if(now<_wait)return "running";
@@ -102,17 +117,21 @@ internal sealed class AreaActionExecutor
                 if(++_hits>40)return End("target_did_not_clear");
                 var health=TreeHealth(target);
                 if(_hits>3&&health==_beforeHealth&&health>0)return End("tool_not_effective");
+                if(_hits>8&&health==_beforeHealth&&IsFragileTarget(target))return End("tool_not_effective");
                 _beforeHealth=health;_wait=0;
             }
             else
             {
                 var verified=_skill=="clear_area"?!Obstacle(target):_skill=="till_area"?Tilled(target):Soil(target)?.crop!=null&&Count(SeedId)==_seedBefore-1;
                 if(!verified)return End("action_not_verified");
+                // Clearing and collecting are separate native effects. Keep
+                // the cleared tile even if its drops cannot all be received.
+                if(!_targetVerified){Completed++;_done.Add(target);_targetVerified=true;}
                 if(_skill=="clear_area")
                 {
                     var pickup=CollectDrops(input,target);if(pickup!="done")return pickup;
                 }
-                Completed++;_done.Add(target);_target=null;_wait=0;_hits=0;_nav.Reset();
+                _target=null;_targetVerified=false;_wait=0;_hits=0;_settleUntil=0;_pickupDeadline=0;_nav.Reset();
             }
         }
         if(Completed>=Num("maxTargets",1024)){Reason="target_limit_reached";return "completed";}
@@ -127,6 +146,9 @@ internal sealed class AreaActionExecutor
                 if(_skill=="plant_area"){
                     if(cells.Any(p=>Soil(p)==null)){Reason="requires_tilled_empty_soil:先clear_area清障，再till_area锄地；plant_area只播种";return Completed>0?"partial":"failed";}
                     if(cells.Any(p=>Soil(p) is {crop:null}))return End("seed_or_season_not_valid_for_remaining_soil");
+                    var expected=ItemRegistry.GetDataOrErrorItem(SeedId).ItemId;
+                    if(cells.Any(p=>!_done.Contains(p)&&Soil(p)?.crop is {} crop&&(crop.dead.Value||crop.netSeedIndex.Value!=expected)))
+                        return End("plant_area_occupied_by_other_or_dead_crops");
                 }
                 Reason=Completed==0?"already_satisfied_no_action":"observed_targets_finished";return "completed";
             }
@@ -135,9 +157,17 @@ internal sealed class AreaActionExecutor
             _beforeHealth=TreeHealth(_target.Value);_pickupDeadline=0;
         }
         var tile=_target.Value;var adjacent=_nav.BestAdjacent(tile);if(adjacent==null)return End("target_unreachable");
+        if(_skill!="plant_area"){
+            var requiredTool=_skill=="till_area"?Game1.player.Items.OfType<Hoe>().FirstOrDefault():ClearTool(tile);
+            if(requiredTool is not null and not MeleeWeapon&&Game1.player.Stamina<2)return End("insufficient_stamina:required_minimum=2");
+        }
         var move=_nav.Move(Map,adjacent.Value,input,_interact);Phase="approach_target";
         if(move is "blocked" or "unsupported")return End(_nav.Reason);
         if(move!="reached")return "running";
+        if(_skill=="clear_area"&&!Obstacle(tile)||_skill=="till_area"&&!CanTill(tile)
+            ||_skill=="plant_area"&&!(Soil(tile) is {crop:null} currentSoil&&currentSoil.canPlantThisSeedHere(ItemRegistry.GetDataOrErrorItem(SeedId).ItemId))){
+            _target=null;_targetVerified=false;_wait=0;_nav.Reset();return "running";
+        }
         Face(tile);
         if(_skill=="plant_area")
         {
@@ -151,27 +181,43 @@ internal sealed class AreaActionExecutor
             Tool? tool=_skill=="till_area"?Game1.player.Items.OfType<Hoe>().FirstOrDefault():ClearTool(tile);
             if(tool==null)return End("required_tool_missing");
             if(tool is MeleeWeapon&&HasScytheHarvestRisk(tile,tool))return End("harvestable_crop_protected_from_scythe_area");
+            if(tool is not MeleeWeapon&&Game1.player.Stamina<2)return End("insufficient_stamina:required_minimum=2");
             Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(tool);input.Tool=true;
         }
-        _wait=now+700;Phase="verify_action";return "running";
+        _wait=now+1500;Phase="verify_action";return "running";
     }
     internal static bool HasScytheHarvestRisk(GridPoint tile,Tool tool)=>Game1.currentLocation.terrainFeatures.Pairs.Any(p=>
         Math.Abs(p.Key.X-tile.X)<=3&&Math.Abs(p.Key.Y-tile.Y)<=3&&p.Value is HoeDirt {crop:not null} soil&&WorldView.Ready(soil.crop)
         &&(soil.crop.GetHarvestMethod()==StardewValley.GameData.Crops.HarvestMethod.Scythe||tool.ItemId=="66"));
     private static float TreeHealth(GridPoint p)=>Game1.currentLocation.terrainFeatures.TryGetValue(new(p.X,p.Y),out var f)&&f is Tree t?t.health.Value:0;
+    private static bool IsFragileTarget(GridPoint p)
+    {
+        var tile=new Vector2(p.X,p.Y);var location=Game1.currentLocation;
+        return location.objects.TryGetValue(tile,out var obj)&&obj.Name is "Weeds" or "Twig"
+            ||location.terrainFeatures.TryGetValue(tile,out var feature)&&feature is Grass;
+    }
     private Tool? ClearTool(GridPoint p)
     {
-        if(Game1.currentLocation.objects.TryGetValue(new(p.X,p.Y),out var obj)&&obj.Name=="Stone")return Game1.player.Items.OfType<Pickaxe>().FirstOrDefault();
+        if(Game1.currentLocation.objects.TryGetValue(new(p.X,p.Y),out var obj))
+        {
+            if(obj.Name=="Stone")return Game1.player.Items.OfType<Pickaxe>().FirstOrDefault();
+            if(obj.Name=="Weeds")return Game1.player.Items.OfType<MeleeWeapon>().FirstOrDefault(t=>t.isScythe());
+        }
         if(Game1.currentLocation.terrainFeatures.TryGetValue(new(p.X,p.Y),out var f)&&f is Grass)return Game1.player.Items.OfType<MeleeWeapon>().FirstOrDefault(t=>t.isScythe());
         return Game1.player.Items.OfType<Axe>().FirstOrDefault();
     }
     private string CollectDrops(AiInputSimulator input,GridPoint target)
     {
-        var drops=Game1.currentLocation.debris.Where(d=>!_oldDebris.Contains(d)&&(d.item!=null||!string.IsNullOrEmpty(d.itemId.Value))
-            &&d.Chunks.Any(c=>Vector2.DistanceSquared(c.position.Value,new Vector2(target.X*64,target.Y*64))<320*320)).ToArray();
-        if(drops.Length==0)return "done";
-        if(_pickupDeadline==0){_pickupDeadline=Environment.TickCount64+20000;_nav.Reset();}
-        if(Environment.TickCount64>_pickupDeadline)return End("drop_pickup_timeout");
+        TrackDrops();
+        var drops=PendingTaskDrops().ToArray();
+        if(drops.Length==0){
+            if(_settleUntil==0)_settleUntil=_clock.Now+700;
+            if(_clock.Now<_settleUntil){Phase="settling_native_pickup";return "running";}
+            Capture();return "done";
+        }
+        _settleUntil=0;
+        if(_pickupDeadline==0){_pickupDeadline=_clock.Now+20000;_nav.Reset();}
+        if(_clock.Now>_pickupDeadline)return End("drop_pickup_timeout");
         var chunk=drops.SelectMany(d=>d.Chunks).OrderBy(c=>Vector2.DistanceSquared(c.position.Value,Game1.player.Position)).FirstOrDefault();
         if(chunk==null)return "done";
         var drop=new GridPoint((int)(chunk.position.X+32)/64,(int)(chunk.position.Y+32)/64);

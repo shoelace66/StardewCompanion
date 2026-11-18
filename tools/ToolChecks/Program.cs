@@ -40,8 +40,8 @@ foreach(var group in groups){var f=group!["function"]!;var variants=f["parameter
 }
 foreach(var name in ToolCatalog.Actions.Where(n=>n!="mine_travel").Concat(BusinessCapabilities.All.Where(c=>!c.Query).Select(c=>c.Name)))Check(covered.Contains(name),"missing action: "+name);
 foreach(var name in new[]{"deposit_items","withdraw_items"}){
-    foreach(var count in new[]{1,9999}){ToolCatalog.ValidateArguments(name,new(){["chest"]="工作箱",["itemId"]="(O)388",["count"]=count});checks++;}
-    foreach(var count in new[]{0,10000})Reject(()=>ToolCatalog.ValidateArguments(name,new(){["chest"]="工作箱",["itemId"]="(O)388",["count"]=count}),"transfer quantity outside the permission range: "+name);
+    foreach(var count in new[]{1,9999}){ToolCatalog.ValidateArguments(name,new(){["chest"]="工作箱",["itemName"]="Stone",["count"]=count});checks++;}
+    foreach(var count in new[]{0,10000})Reject(()=>ToolCatalog.ValidateArguments(name,new(){["chest"]="工作箱",["itemName"]="Stone",["count"]=count}),"transfer quantity outside the permission range: "+name);
 }
 var waitSchema=tools.First(t=>t!["function"]!["name"]!.ToString()=="wait_for_change")!["function"]!["parameters"]!;
 foreach(var seconds in new[]{1,120}){Validate(waitSchema,new JsonObject{["seconds"]=seconds,["reason"]="waiting for native state"});checks++;}
@@ -50,9 +50,9 @@ var go=new JsonObject{["location"]="Farm",["x"]=1,["y"]=1};ToolCatalog.ValidateA
 var badGo=(JsonObject)go.DeepClone();badGo["pickupRadius"]=9;Reject(()=>ToolCatalog.ValidateArguments("go_to",badGo),"pickup radius limit ignored");
 var water=new JsonObject{["location"]="Farm",["x"]=1,["y"]=1,["width"]=32,["height"]=32};ToolCatalog.ValidateArguments("water_area",water);checks++;
 water["width"]=33;Reject(()=>ToolCatalog.ValidateArguments("water_area",water),"area exceeds native 32 tile limit");
-var state=new GameObservation{WorldReady=true,IsHost=false,Location="Farm"};
+var state=new GameObservation{WorldReady=true,IsHost=false,Location="Farm",WorldView="{\"inventory\":[{\"id\":\"(O)388\",\"name\":\"Stone\"}]}"};
 var chest=new ChestBinding("工作箱","bound","Farm",1,2,new[]{"(O)388"},Array.Empty<string>());
-var deposit=new JsonObject{["chest"]="工作箱",["itemId"]="(O)388",["count"]=1};
+var deposit=new JsonObject{["chest"]="工作箱",["itemName"]="Stone",["count"]=1};
 Check(PermissionPolicy.Authorize("deposit_items",deposit,new[]{chest},state)["chestId"]!.ToString()=="bound","storage binding lost");
 deposit["count"]=0;Reject(()=>PermissionPolicy.Authorize("deposit_items",deposit,new[]{chest},state),"invalid transfer quantity accepted");
 deposit["count"]=1;deposit["chestId"]="forged";Reject(()=>PermissionPolicy.Authorize("deposit_items",deposit,new[]{chest},state),"forged internal field accepted");

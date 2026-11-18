@@ -13,14 +13,14 @@ public sealed class PlayerGoalUpdate
     public string Autonomy {get;set;}="除矿洞外的游戏功能均已开放，由模型自主决定工作与休息。";
     public string[] DisabledSkills {get;set;}=new[]{"mine_travel"};
     public int? ExpectedVersion {get;set;}
+    public bool ReplaceObjective {get;set;}=true;
 }
 
 public sealed partial class CompanionRuntime
 {
     private static readonly JsonSerializerOptions InputJson=new(){PropertyNamingPolicy=JsonNamingPolicy.CamelCase};
     private readonly object _inputGate=new();
-    private bool _expandedTools;
-    private string[] _scopedPlanSkills=Array.Empty<string>();
+    private long _expandToolsForEpoch=-1;
     private string _triggerKind="state_changed";
     private JsonObject _lastInput=new();
     public JsonObject InputPreview {get {lock(_inputGate)return (JsonObject)_lastInput.DeepClone();}}
@@ -28,12 +28,12 @@ public sealed partial class CompanionRuntime
     {
         get {lock(_inputGate){
             if(_scope=="")return new JsonObject();
-            if(JsonNode.Parse(_memory.Get(_scope,"player_goal")??"null") is JsonObject goal)return goal;
-            var legacy=JsonNode.Parse(_memory.Get(_scope,"player_instructions")??"[]") as JsonArray??new();
-            var migrated=JsonSerializer.SerializeToNode(new PlayerGoalUpdate{Objective=string.Join("\n",legacy.Select(v=>v?.ToString()??""))},InputJson)!.AsObject();
-            migrated.Remove("expectedVersion");
-            migrated["originalInstructions"]=legacy.DeepClone();migrated["version"]=1;migrated["status"]=legacy.Count>0?"active":"unset";
-            _memory.Set(_scope,"player_goal",migrated.ToJsonString());return migrated;
+            if(JsonNode.Parse(_memory.Get(_scope,"player_goal")??"null") is JsonObject stored)
+                return new JsonObject(new[]{"objective","completionCondition","priorities","restrictions","autonomy","disabledSkills","version","status"}
+                    .Where(stored.ContainsKey).Select(key=>KeyValuePair.Create(key,stored[key]?.DeepClone())));
+            var goal=JsonSerializer.SerializeToNode(new PlayerGoalUpdate(),InputJson)!.AsObject();
+            goal.Remove("expectedVersion");goal.Remove("replaceObjective");
+            goal["version"]=0;goal["status"]="unset";return goal;
         }}
     }
     public async Task<JsonObject> UpdateGoal(PlayerGoalUpdate update)
@@ -50,16 +50,18 @@ public sealed partial class CompanionRuntime
             if(expectedScope!=_scope||expectedSession!=_session)throw new InvalidOperationException("游戏会话已变化，请重新加载目标");
             var old=PlayerGoal;
             if(update.ExpectedVersion.HasValue&&update.ExpectedVersion.Value!=(old["version"]?.GetValue<int>()??0))throw new InvalidOperationException("长期目标已在其他入口更新，请重新加载后保存");
-            goal=JsonSerializer.SerializeToNode(update,InputJson)!.AsObject();goal.Remove("expectedVersion");
+            goal=JsonSerializer.SerializeToNode(update,InputJson)!.AsObject();goal.Remove("expectedVersion");goal.Remove("replaceObjective");
             goal["version"]=(old["version"]?.GetValue<int>()??0)+1;goal["status"]="active";
-            goal["originalInstructions"]=new JsonArray(update.Objective);
             _memory.Set(_scope,"player_goal",goal.ToJsonString());
             // A replacement goal retires an earlier question. This does not grant
             // any permission; action-level policies still require their own authorization.
             PendingQuestion="";_memory.Set(_scope,"pendingQuestion","");
-            var work=WorkState();work["currentObjective"]="";work["objectiveBasis"]="";work["next"]=new JsonArray();
+            var work=WorkState();
+            if(update.ReplaceObjective){work["currentObjective"]="";work["objectiveBasis"]="";}
+            work["next"]=new JsonArray();work["activePlanId"]="";
             work["goalVersion"]=goal["version"]!.DeepClone();_memory.Set(_scope,"agent_working_state",work.ToJsonString());
-            _expandedTools=false;_scopedPlanSkills=Array.Empty<string>();_triggerKind="goal_updated";
+            _triggerKind="goal_updated";
+            if(Mode=="plan_only")_planningPaused=false;
         }
         if(expectedScope==_scope&&expectedSession==_session){
             RetireWorkingBlockers();Invalidate();if(_bridge.Observation?.ActiveTaskId is {Length:>0})await _bridge.Control("cancel");
@@ -71,17 +73,22 @@ public sealed partial class CompanionRuntime
     private JsonObject WorkState()
     {
         if(JsonNode.Parse(_memory.Get(_scope,"agent_working_state")??"null") is JsonObject saved)return saved;
-        var latest=Plans.OrderByDescending(p=>p.UpdatedAt).FirstOrDefault();
-        var work=new JsonObject{["currentObjective"]=latest?.Goal??"",["objectiveBasis"]=latest?.Basis??"",
-            ["next"]=JsonSerializer.SerializeToNode((latest?.Pending??Array.Empty<string>()).Take(8).ToArray()),["confirmedMilestones"]=new JsonArray()};
+        var work=new JsonObject{["currentObjective"]="",["objectiveBasis"]="",
+            ["next"]=new JsonArray(),["confirmedMilestones"]=new JsonArray()};
         _memory.Set(_scope,"agent_working_state",work.ToJsonString());return work;
     }
     private void ReconcileWorkingSession(GameObservation observation)
     {
         lock(_inputGate){var work=WorkState();
             if(work["session"]?.ToString()!=observation.SessionId){
+                var history=work["historicalMilestones"] as JsonArray??new JsonArray();
+                foreach(var milestone in (work["confirmedMilestones"] as JsonArray??new()).OfType<JsonObject>()){
+                    var stale=(JsonObject)milestone.DeepClone();stale["knowledge"]="historical_requires_recheck";history.Add(stale);
+                }
+                work["historicalMilestones"]=new JsonArray(history.TakeLast(16).Select(m=>m?.DeepClone()).ToArray());
                 work["confirmedMilestones"]=new JsonArray();work["session"]=observation.SessionId;
-                work["currentObjective"]="";work["objectiveBasis"]="";work["next"]=new JsonArray();work["activePlanId"]="";
+                work["objectiveKnowledge"]="requires_recheck_after_session_change";
+                work["next"]=new JsonArray();work["activePlanId"]="";
                 _memory.Set(_scope,"agent_working_state",work.ToJsonString());
             }
             _lastInput=new JsonObject();
@@ -89,7 +96,7 @@ public sealed partial class CompanionRuntime
     }
     private void RetireWorkingDay()
     {
-        lock(_inputGate){var work=WorkState();work["currentObjective"]="";work["objectiveBasis"]="";work["next"]=new JsonArray();work["activePlanId"]="";
+        lock(_inputGate){var work=WorkState();work["next"]=new JsonArray();work["activePlanId"]="";
             _memory.Set(_scope,"agent_working_state",work.ToJsonString());}
     }
     private void RetireWorkingBatch(string planId)
@@ -103,7 +110,7 @@ public sealed partial class CompanionRuntime
             var goal=PlayerGoal;goal["status"]="cancelled";goal["version"]=(goal["version"]?.GetValue<int>()??0)+1;
             _memory.Set(_scope,"player_goal",goal.ToJsonString());_memory.Set(_scope,"conversation_outbox","[]");
             var work=WorkState();work["currentObjective"]="";work["objectiveBasis"]="";work["next"]=new JsonArray();
-            _memory.Set(_scope,"agent_working_state",work.ToJsonString());_expandedTools=false;_scopedPlanSkills=Array.Empty<string>();
+            _memory.Set(_scope,"agent_working_state",work.ToJsonString());
         }
     }
     private void UpdateWorkingPlan(JsonObject args,bool replaceObjective)
@@ -111,6 +118,7 @@ public sealed partial class CompanionRuntime
         lock(_inputGate){var work=WorkState();
             if(replaceObjective||string.IsNullOrEmpty(work["currentObjective"]?.ToString())){
                 work["currentObjective"]=DecisionContextCompression.Text(args,"goal");work["objectiveBasis"]=DecisionContextCompression.Text(args,"basis");
+                work["objectiveKnowledge"]="current_session_plan";
             }
             if(args["pending"] is JsonArray next)work["next"]=new JsonArray(next.Take(8).Select(v=>v?.DeepClone()).ToArray());
             work["activePlanId"]=args["planId"]?.DeepClone();
@@ -171,9 +179,10 @@ public sealed partial class CompanionRuntime
         }
     }
     private static bool MiningSkill(string skill)=>skill.Contains("mine",StringComparison.OrdinalIgnoreCase)||skill.Contains("cavern",StringComparison.OrdinalIgnoreCase);
-    private HashSet<string> DisabledSkills()=>new((PlayerGoal["DisabledSkills"] as JsonArray??PlayerGoal["disabledSkills"] as JsonArray??new()).Select(v=>v!.ToString()).Append("mine_travel"),StringComparer.Ordinal);
+    private HashSet<string> DisabledSkills()=>new((PlayerGoal["disabledSkills"] as JsonArray??new()).Select(v=>v!.ToString()).Append("mine_travel"),StringComparer.Ordinal);
     private void ValidateSkillScope(string skill,JsonObject? args=null)
     {
+        if(_bridge.Observation?.Menu=="DialogueBox"&&skill!="respond_dialogue")throw new InvalidOperationException("blocking_dialogue_requires_response");
         if(MiningSkill(skill)||DisabledSkills().Contains(skill))throw new InvalidOperationException("skill_disabled:"+skill);
         foreach(var field in new[]{"location","destination","toLocation"}){
             var location=args?[field]?.ToString()??"";
@@ -181,38 +190,66 @@ public sealed partial class CompanionRuntime
                 throw new InvalidOperationException("location_disabled:"+location);
         }
     }
-    private JsonArray DecisionTools(GameObservation state)
+    private HashSet<string> DailySkills(GameObservation state,JsonObject world,JsonObject goal,JsonObject conversation)
+    {
+        var skills=new HashSet<string>(ToolCatalog.TopLevelFrequentTools,StringComparer.Ordinal){
+            "return_home","refill_water","gather_resource","forage_route","travel","craft_items","craft_and_place",
+            "purchase_items","sell_items","visit_villagers","recover","end_day"
+        };
+        var work=WorkState();
+        var intent=string.Join("\n",goal["objective"],goal["priorities"],work["currentObjective"],work["next"],conversation["newMessages"]);
+        bool Mentions(string value)=>intent.Contains(value,StringComparison.OrdinalIgnoreCase);
+        bool HasEntries(string field)=>world[field] is JsonArray {Count:>0};
+
+        if(state.Location=="Farm"||HasEntries("soil")||Mentions("种植")||Mentions("作物")||Mentions("farm"))
+            skills.UnionWith(new[]{"cultivate_plot","maintain_plot","harvest_and_replant"});
+        if(world["decisionFacts"]?["knownFarmProgress"]?["starterGiftPresent"]?.GetValue<bool>()==true||
+           world["decisionFacts"]?["starterSeeds"]?["giftPresentHere"]?.GetValue<bool>()==true)
+            skills.Add("claim_starter_gift");
+        if(HasEntries("animals")||HasEntries("livestockHomes"))skills.Add("tend_animals");
+        if(HasEntries("pets"))skills.Add("care_for_pets");
+        if(world["toolUpgrade"]!=null)skills.Add("collect_upgraded_tool");
+        if(world["museumDisplay"]!=null)skills.Add("donate_museum");
+        if(world["junimoBundles"]!=null)skills.Add("donate_bundle");
+        if(world["activeEvent"]!=null)skills.Add("attend_event");
+        if(world["fishing"]?["rodEquipped"]?.GetValue<bool>()==true||Mentions("钓鱼")||Mentions("fishing"))skills.Add("fish_at");
+        if(world["combat"]?["visibleMonsters"] is JsonArray {Count:>0})skills.Add("fight_enemies");
+        if(state.Menu!="")skills.Add("respond_dialogue");
+
+        // Keep capabilities named by the current work and skills with recent native receipts.
+        skills.UnionWith(BusinessCapabilities.All.Select(c=>c.Name).Where(Mentions));
+        skills.UnionWith(ToolCatalog.Actions.Where(Mentions));
+        skills.UnionWith(_recentResults.Select(r=>r.Skill));
+        return skills;
+    }
+    private JsonArray DecisionTools(GameObservation state,JsonObject conversation,bool expanded)
     {
         var all=ToolCatalog.Definitions(false,state.Capabilities);
-        var w=JsonNode.Parse(state.WorldView) as JsonObject??new();var facts=w["decisionFacts"];
-        var work=WorkState();var intent=(work["currentObjective"]?.ToString()??"")+(PlayerGoal["objective"]?.ToString()??"");
-        var skills=new HashSet<string>(new[]{"go_to","return_home","sleep","forage_area"});
-        skills.UnionWith(_scopedPlanSkills);
-        var farming=state.Location=="Farm"||intent.Contains("种")||intent.Contains("作物")||intent.Contains("开荒")||intent.Contains("farm",StringComparison.OrdinalIgnoreCase);
-        if(farming)skills.UnionWith(new[]{"water_area","harvest_area","refill_water","cultivate_plot","maintain_plot","harvest_and_replant","gather_resource","clear_area","till_area","plant_area"});
-        if(_memory.Chests(_scope).Length>0)
-            skills.UnionWith(new[]{"deposit_items","withdraw_items"});
-        skills.UnionWith(new[]{"craft_items","craft_and_place"});
-        if(state.Menu!="")skills.Add("respond_dialogue");
-        if(intent.Contains("钓")||intent.Contains("fish",StringComparison.OrdinalIgnoreCase))skills.Add("fish_at");
-        if((w["combat"]?["visibleMonsters"] as JsonArray)?.Count>0||intent.Contains("战斗"))skills.Add("fight_enemies");
-        if(state.TimeOfDay>=2200||state.Stamina<40)skills.Add("recover");
+        var w=JsonNode.Parse(state.WorldView) as JsonObject??new();
+        var goal=PlayerGoal;
+        var skills=expanded?null:DailySkills(state,w,goal,conversation);
         var queries=new HashSet<string>(new[]{"observe","survey_area","inspect_area","inspect_target","inspect_targets","inspect_route","ask_user","wait_for_change","list_capabilities","save_plan","read_context_history"});
         if((w["mailbox"]?["unreadCount"]?.GetValue<int>()??0)>0)queries.Add("read_mailbox");
-        var disabled=DisabledSkills();var output=new JsonArray();
-        foreach(var tool in all){var clone=tool!.DeepClone();var f=clone["function"]!;var name=f["name"]!.ToString();
-            if((name is "deposit_items" or "withdraw_items")&&_memory.Chests(_scope).Length==0)continue;
-            if(MiningSkill(name)||disabled.Contains(name))continue;
+        var disabled=new HashSet<string>((goal["disabledSkills"] as JsonArray??new()).Select(v=>v!.ToString()),StringComparer.Ordinal);
+        var hasBoundChest=_memory.Chests(_scope).Length>0;
+        bool IsBlocked(string name)=>MiningSkill(name)||disabled.Contains(name)||!hasBoundChest&&(name is "deposit_items" or "withdraw_items");
+        var output=new JsonArray();
+        foreach(var tool in all.ToArray()){
+            var f=tool!["function"]!;var name=f["name"]!.ToString();
+            if(IsBlocked(name)||state.Menu=="NamingMenu"&&name is not ("observe" or "list_capabilities" or "ask_user"))continue;
+            if(state.Menu=="DialogueBox"&&ToolCatalog.Actions.Contains(name)&&name!="respond_dialogue")continue;
             if(name.StartsWith("group_",StringComparison.Ordinal)){
                 var variants=f["parameters"]!["properties"]!["steps"]!["items"]!["oneOf"]!.AsArray();
                 foreach(var variant in variants.ToArray()){
                     var skill=variant!["properties"]!["skill"]!["enum"]![0]!.ToString();
-                    var needsBoundChest=skill is "deposit_items" or "withdraw_items";
-                    if(MiningSkill(skill)||disabled.Contains(skill)||needsBoundChest&&_memory.Chests(_scope).Length==0)variants.Remove(variant);
+                    if(IsBlocked(skill)||state.Menu=="DialogueBox"&&skill!="respond_dialogue"||
+                       skills!=null&&!skills.Contains(skill))variants.Remove(variant);
                 }
                 if(variants.Count==0)continue;
-            }else if(!_expandedTools&&!queries.Contains(name)&&!ToolCatalog.TopLevelFrequentTools.Contains(name))continue;
-            output.Add(clone);
+            }else if(!expanded&&!queries.Contains(name)&&!ToolCatalog.TopLevelFrequentTools.Contains(name)&&
+                      !(BusinessCapabilities.Find(name) is {Query:true}&&skills!.Contains(name)))continue;
+            all.Remove(tool);
+            output.Add(tool);
         }
         return output;
     }
@@ -226,7 +263,7 @@ public sealed partial class CompanionRuntime
         return new JsonObject{["allowedSkillsThisTurn"]=new JsonArray(skills.Select(s=>(JsonNode?)JsonValue.Create(s)).ToArray()),
             ["availableQueries"]=new JsonArray(tools.Select(t=>t?["function"]?["name"]?.ToString()??"").Where(n=>ToolCatalog.Queries.Contains(n)||BusinessCapabilities.Find(n) is {Query:true}||n is "read_context_history" or "list_capabilities").Select(n=>(JsonNode?)JsonValue.Create(n)).ToArray()),
             ["availableTools"]=new JsonArray(tools.Select(t=>t?["function"]?["name"]?.DeepClone()).ToArray()),
-            ["capabilityAccess"]="八个类别工具对应不同工作域；调用list_capabilities展开完整技能范围",["historyAccess"]="read_context_history"};
+            ["capabilityAccess"]="所需技能未列出时，调用list_capabilities在下一轮展开已开放技能及参数",["historyAccess"]="read_context_history"};
     }
     private JsonObject BuildDecisionInput(GameObservation state,JsonObject delivery,JsonObject conversation,JsonArray tools,string reason)
     {
@@ -235,7 +272,7 @@ public sealed partial class CompanionRuntime
             var work=WorkState();var feedback=delivery["actionFeedback"];
             work["mode"]=Mode;work["running"]=_resumed;
             var allowedSkills=ScopeFor(tools)["allowedSkillsThisTurn"]!.AsArray().Select(v=>v!.ToString()).ToHashSet();
-            work["confirmedMilestones"]=new JsonArray(work["confirmedMilestones"]!.AsArray().Where(m=>allowedSkills.Contains(m?["skill"]?.ToString()??"")||m?["reason"]?.ToString()=="chest_bound").TakeLast(16).Select(m=>m?.DeepClone()).ToArray());
+            work["confirmedMilestones"]=new JsonArray(work["confirmedMilestones"]!.AsArray().TakeLast(16).Select(m=>m?.DeepClone()).ToArray());
             work["phase"]=PendingQuestion!=""?"awaiting_player":(feedback?["blockers"] as JsonArray)?.Count>0?"blocked":state.ActiveTaskId!=""?"executing":"deciding";
             work["blocked"]=feedback?["blockers"]?.DeepClone()??new JsonArray();
             work["lastAction"]=feedback?["latest"]?.DeepClone();
@@ -243,14 +280,16 @@ public sealed partial class CompanionRuntime
             if(feedback?["latest"] is {} last&&feedback["revision"]?.ToString()!=feedback["deliveredRevision"]?.ToString())
                 events.Add(new JsonObject{["kind"]="action_result",["status"]=last["status"]?.DeepClone()??last["result"]?["status"]?.DeepClone(),
                     ["reason"]=last["reason"]?.DeepClone()??last["result"]?["reason"]?.DeepClone(),["detailsReference"]="agentState.lastAction"});
-            var memories=JsonSerializer.SerializeToNode(_memory.Relevant(_scope,work["currentObjective"]?.ToString()??""))!.AsArray();
-            var relevant=memories.Where(m=>DecisionContextCompression.Text(m,"kind")=="routine").Take(3).Select(m=>new JsonObject{
-                ["id"]=DecisionContextCompression.Get(m,"id")?.DeepClone(),["text"]=DecisionContextCompression.Decode(DecisionContextCompression.Get(m,"text")),["source"]=DecisionContextCompression.Get(m,"source")?.DeepClone()}).ToArray();
-            var goal=PlayerGoal;goal.Remove("originalInstructions");
+            var relevant=ProjectRelevantMemories(work["currentObjective"]?.ToString()??"");
+            var goal=PlayerGoal;
             var pendingEvents=delivery["pendingEvents"] as JsonArray??new();
-            var kind=(conversation["newMessages"] as JsonArray)?.Count>0?"player_message":pendingEvents.Any(e=>e?["type"]?.ToString()=="day_changed")?"new_day":
+            var kind=_waitCompletion is not null
+                ?_waitCompletion["status"]?.ToString()=="timed_out"?"wait_timeout":"wait_condition_changed"
+                :(conversation["newMessages"] as JsonArray)?.Count>0?"player_message":pendingEvents.Any(e=>e?["type"]?.ToString()=="day_changed")?"new_day":
                 pendingEvents.Count>0?"important_event":feedback?["revision"]?.ToString()!=feedback?["deliveredRevision"]?.ToString()?"task_terminal":_triggerKind;
-            var triggerReason=kind switch{
+            var triggerReason=_waitCompletion is not null
+                ?$"等待条件已{(_waitCompletion["status"]?.ToString()=="timed_out"?"超时":"满足")}；核对waitCompletion和当前原生状态后停止重复等待"
+                :kind switch{
                 "player_message"=>"玩家发来新消息", "goal_updated"=>"玩家更新了长期目标", "new_day"=>"进入新的游戏日", "task_terminal"=>"本地操作已返回结果",
                 "no_action_retry"=>"上一轮只叙述计划但未选择可执行工具；请选择一个下一步工具，或明确调用wait_for_change等待条件",
                 "important_event"=>"收到游戏事件或操作结果", "wait_condition_changed"=>"等待条件已变化", "session_started"=>"连接当前游戏会话", _=>"继续推进当前工作"};
@@ -259,10 +298,15 @@ public sealed partial class CompanionRuntime
             var input=new JsonObject{
                 ["trigger"]=new JsonObject{["kind"]=kind,["gameDay"]=state.GameDay,["reason"]=triggerReason},
                 ["playerGoal"]=goal,["conversation"]=conversation.DeepClone(),["agentState"]=work,
+                ["planning"]=PlanningPreview,["continuation"]=_continuation?.DeepClone(),
+                ["waitCompletion"]=_waitCompletion?.DeepClone(),
                 ["world"]=ProjectWorld(state,tools),["recentEvents"]=events,
-                ["relevantMemories"]=new JsonArray(relevant.Select(m=>(JsonNode?)m).ToArray()),["decisionScope"]=ScopeFor(tools)};
+                ["activeProjects"]=ProjectActiveProjects(),
+                ["candidateActions"]=JsonSerializer.SerializeToNode(GreedyCandidates.Read(state).Where(c=>allowedSkills.Contains(DecisionContextCompression.Text(JsonSerializer.SerializeToNode(c),"skill"))).ToArray()),
+                ["relevantMemories"]=relevant,["decisionScope"]=ScopeFor(tools)};
             var memoryList=input["relevantMemories"]!.AsArray();
-            while(input.ToJsonString(DecisionContextCompression.ReadableJson).Length>32000&&memoryList.Count>0)memoryList.RemoveAt(memoryList.Count-1);
+            while(input.ToJsonString(DecisionContextCompression.ReadableJson).Length>32000&&memoryList.Any(m=>m?["kind"]?.ToString()!="agreement"))
+                memoryList.Remove(memoryList.Last(m=>m?["kind"]?.ToString()!="agreement"));
             var size=input.ToJsonString(DecisionContextCompression.ReadableJson).Length;
             Trace("input_projection",new{characters=size,softLimit=32000,overBudget=size>32000,toolsCharacters=tools.ToJsonString(DecisionContextCompression.ReadableJson).Length});
             _lastInput=(JsonObject)input.DeepClone();return input;
@@ -276,6 +320,8 @@ public sealed partial class CompanionRuntime
             ["maxStamina"]=facts?["maxStamina"]?.DeepClone()??w["maxStamina"]?.DeepClone(),["maxHealth"]=facts?["maxHealth"]?.DeepClone(),
             ["money"]=w["money"]?.DeepClone(),["rain"]=w["rain"]?.DeepClone(),["inventoryState"]=w["inventoryState"]?.DeepClone(),
             ["mailbox"]=w["mailbox"]?.DeepClone(),["menu"]=state.Menu,["menuContext"]=JsonNode.Parse(state.MenuContext),
+            ["museumDisplay"]=w["museumDisplay"]?.DeepClone(),["livestockHomes"]=w["livestockHomes"]?.DeepClone(),
+            ["junimoBundles"]=w["junimoBundles"]?.DeepClone(),
             ["calendar"]=facts?["calendar"]?.DeepClone(),["risks"]=new JsonObject{["nativeForcedPassOutTime"]=facts?["nativeForcedPassOutTime"]?.DeepClone(),
                 ["gameMinutesUntil2AM"]=facts?["gameMinutesUntil2AM"]?.DeepClone(),["staminaUntilNativePassOut"]=facts?["staminaUntilNativePassOut"]?.DeepClone(),["consequences"]=facts?["consequences"]?.DeepClone()},
             ["authorizedChests"]=JsonSerializer.SerializeToNode(_memory.Chests(_scope).OrderBy(c=>c.Location==state.Location?0:1).Take(4).ToArray()),
@@ -301,6 +347,8 @@ public sealed partial class CompanionRuntime
         world["queryFacts"]=factsList;
         world["starterGift"]=facts?["starterSeeds"]?.DeepClone();
         var allowed=ScopeFor(tools)["allowedSkillsThisTurn"]!.AsArray().Select(v=>v!.ToString()).ToHashSet();
+        world["farmingPlan"]=FarmingSummary(w,state);
+        world["risks"]!["activeConstraints"]=ProjectBlockerConstraints();
         if(allowed.Contains("fish_at"))world["fishing"]=w["fishing"]?.DeepClone();
         if(allowed.Contains("fight_enemies"))world["combat"]=w["combat"]?.DeepClone();
         return world;

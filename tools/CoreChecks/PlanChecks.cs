@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -7,6 +7,41 @@ using StardewCompanion.Protocol;
 
 internal static class PlanChecks
 {
+    internal static async Task RunContinuation(string folder)
+    {
+        Directory.CreateDirectory(folder);
+        foreach(var scenario in new[]{"eight","direct","failure","pause"}){
+            var bridge=new PlanBridge(scenario);
+            bridge.Observation!.WorldView="""{"decisionFacts":{"calendar":{"season":"spring"}}}""";
+            var args=new JsonObject{["planId"]="continuation-test",["steps"]=new JsonArray(Enumerable.Range(0,8).Select(i=>(JsonNode)new JsonObject{
+                ["skill"]="go_to",["arguments"]=new JsonObject{["location"]="Farm",["x"]=i+1,["y"]=15}}).ToArray())};
+            var handler=new PlanModel(args,bridge);
+            var settings=new ModelSettings{Endpoint="http://127.0.0.1:1/chat/completions",Model="local-test"};settings.SetKey("not-real");
+            await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(folder,scenario+".db")),settings,new HttpClient(handler),Path.Combine(folder,scenario+".jsonl"));
+            bridge.Publish();
+            runtime.Memory.Set(runtime.Scope,"player_goal","""{"status":"active","objective":"reach the targets then harvest","version":1}""");
+            runtime.Memory.Set(runtime.Scope,"season_plan","""{"year":1,"season":"spring","goalVersion":1,"goal":"farm","constraints":["no mining"],"successCriteria":["targets reached"],"milestones":["walk"],"resourceStrategy":["reserve stamina"]}""");
+            runtime.SendMessage("reach the targets then harvest");await runtime.Resume();runtime.Start();
+            if(runtime.PlanningPreview["ready"]?.GetValue<bool>()!=true
+                ||runtime.PlanningPreview.ContainsKey("dayPlan")||runtime.PlanningPreview.ContainsKey("dayCurrent")
+                ||ToolCatalog.RequiredPlanningDefinitions().Count!=1)
+                throw new Exception("FAIL: a valid season plan must allow execution without a daily plan");
+            var until=Environment.TickCount64+5000;
+            while(handler.Continuations==0&&Environment.TickCount64<until)await Task.Delay(10);
+            if(handler.Continuations!=1||!handler.ContinuationWhileRunning)throw new Exception("FAIL: preplanning must overlap game execution");
+            if(scenario=="pause")await runtime.Pause();
+            while(!runtime.Decisions.Read().Any(e=>e.Kind=="plan_finished")&&Environment.TickCount64<until)await Task.Delay(10);
+            if(scenario is "eight" or "direct"){
+                while(!handler.SawContinuation&&Environment.TickCount64<until)await Task.Delay(10);
+                if(!handler.SawContinuation||bridge.Commands.Count!=(scenario=="direct"?1:8))throw new Exception("FAIL: verified next decision must receive continuation without executing speculative actions");
+            }else{
+                await Task.Delay(300);
+                if(runtime.Decisions.Read().Any(e=>e.Kind=="continuation_planned")||bridge.Commands.Count!=(scenario=="pause"?1:2))throw new Exception("FAIL: failed or paused predecessors must discard speculative responses");
+            }
+            await runtime.Pause();Console.WriteLine("PASS: continuous planning "+scenario);
+        }
+    }
+
     internal static async Task Run(string folder)
     {
         static void Check(bool ok,string name){if(!ok)throw new Exception("FAIL: "+name);Console.WriteLine("PASS: "+name);}
@@ -25,13 +60,6 @@ internal static class PlanChecks
         var minePlan=new JsonObject{["planId"]="mine-plan",["steps"]=new JsonArray(new JsonObject{["skill"]="mine_travel",["arguments"]=new JsonObject{["targetFloor"]=5}})};
         try{PermissionPolicy.Authorize("mine_travel",minePlan["steps"]![0]!["arguments"]!.AsObject(),Array.Empty<ChestBinding>(),new(){WorldReady=true});throw new Exception("Disabled mine travel was authorized");}
         catch(InvalidOperationException){Check(true,"mine travel remains disabled at the permission boundary");}
-        using(var db=new MemoryStore(Path.Combine(folder,"persistent-instructions.db"))){
-            db.AppendPlayerInstruction("a","five days; no fishing");
-            for(var i=0;i<30;i++)db.Chat("a","assistant","intention only");
-            Check(db.PlayerInstructions("a").Single()=="five days; no fishing"&&db.PlayerInstructions("b").Length==0,"player objective survives chat truncation and is isolated by scope");
-        }
-        using(var db=new MemoryStore(Path.Combine(folder,"persistent-instructions.db")))
-            Check(db.PlayerInstructions("a").Single().Contains("no fishing"),"objective survives application restart");
         var treeArgs=Args(1);treeArgs["steps"]![0]!["skill"]="clear_area";treeArgs["steps"]![0]!["arguments"]=new JsonObject{["location"]="Farm",["x"]=10,["y"]=10,["width"]=3,["height"]=3,["targetType"]="tree",["removeStumps"]=false};
         Check(ShortPlan.Parse(treeArgs).Steps[0].Arguments["targetType"]!.GetValue<string>()=="tree","mature trees are reachable through the actual model plan schema with explicit stump policy");
         treeArgs["steps"]![0]!["arguments"]!["removeStumps"]="false";Reject(treeArgs);
@@ -61,10 +89,16 @@ internal static class PlanChecks
                 Check(bridge.Commands.Count==8&&handler.BetweenStepRequests==0,"eight verified steps execute with one model selection and no between-step requests");
                 await Task.Delay(700);
                 Check(handler.Requests>=2,"plan completion wakes the next decision without twenty-second delay");
+                Check(handler.Continuations==1&&handler.ContinuationWhileRunning,"model plans a continuation while the previous batch is executing");
+                Check(handler.SawContinuation,"next decision receives the hypothetical continuation for verification against actual results");
                 Check(bridge.Commands.Count==8,"duplicate plan id is not executed a second time");
                 if(scenario=="save_then_execute")Check(runtime.Plans.Single().Revision>=2,"saving a public plan allows a group tool in the same model response");
                 if(scenario=="invalid_json")Check(handler.Requests>=2&&runtime.Decisions.Read().Any(e=>e.Kind=="tool_rejected")&&!runtime.Decisions.Read().Any(e=>e.Kind=="model_error"),"malformed arguments are returned to the model for correction without a global one-minute failure cooldown");
-            }else Check(bridge.Commands.Count==2,"failed step stops all remaining steps");
+            }else {
+                Check(bridge.Commands.Count==2,"failed step stops all remaining steps");
+                await Task.Delay(250);
+                Check(!runtime.Decisions.Read().Any(e=>e.Kind=="continuation_planned"),"failure discards a late speculative response without recording success or dispatching its next steps");
+            }
             if(scenario=="low_stamina_late"){
                 Check(!runtime.Decisions.Read().Any(e=>e.Kind=="safety_trigger"||e.Kind=="task_dispatch"&&e.Data.GetProperty("source").GetString()!="model"),"negative stamina and 25:30 never trigger local return-home or sleep takeover");
             }
@@ -156,14 +190,13 @@ internal static class PlanChecks
             var bridge=new PlanBridge("new_day");var handler=new IdleModel();
             var settings=new ModelSettings{Endpoint="http://127.0.0.1:1/chat/completions",Model="local-test"};settings.SetKey("not-real");
             await using var runtime=new CompanionRuntime(bridge,new MemoryStore(Path.Combine(folder,"day-maintenance-followup.db")),settings,new HttpClient(handler),Path.Combine(folder,"day-maintenance-followup.jsonl"));
+            bridge.Observation!.WorldView="""{"decisionFacts":{"calendar":{"season":"spring"}}}""";
             bridge.Publish();
-            var legacy=System.Text.Encoding.Latin1.GetString(System.Text.Encoding.UTF8.GetBytes("土豆种植"));
-            runtime.Memory.Set(runtime.Scope,"season_plan",JsonSerializer.Serialize(new{Year=1,Season="spring",Goal=legacy,Constraints=Array.Empty<string>(),SuccessCriteria=Array.Empty<string>(),Progress=new[]{legacy},CreatedAt="test"}));
+            await runtime.UpdateGoal(new(){Objective="土豆种植"});
+            runtime.Memory.Set(runtime.Scope,"season_plan",JsonSerializer.Serialize(new{year=1,season="spring",goal="土豆种植",constraints=new[]{"仅使用实际资金"},successCriteria=new[]{"核验实际收获"},progress=Array.Empty<string>(),createdAt="test",goalVersion=1,milestones=new[]{"春季种植"},resourceStrategy=new[]{"保留浇水体力"}}));
             await runtime.Resume();runtime.Start();
             var deadline=Environment.TickCount64+5000;
             while(handler.Requests<3&&Environment.TickCount64<deadline)await Task.Delay(10);
-            var normalized=JsonNode.Parse(runtime.Memory.Get(runtime.Scope,"season_plan")!)!;
-            Check(normalized["goal"]?.ToString()=="土豆种植"&&normalized["progress"]?[0]?.ToString()=="土豆种植","legacy season plan casing and recoverable UTF-8 mojibake normalize without losing progress");
             var working=JsonNode.Parse(runtime.Memory.Get(runtime.Scope,"agent_working_state")!)!.AsObject();working["currentObjective"]="finish spring 1";working["next"]=new JsonArray("old pending step");runtime.Memory.Set(runtime.Scope,"agent_working_state",working.ToJsonString());
             for(var i=0;i<15;i++)bridge.PublishResult("day-result-"+i);
             bridge.Observation!.GameDay=1;bridge.PublishNextObservation();
@@ -173,7 +206,7 @@ internal static class PlanChecks
             var maintenance=JsonNode.Parse(runtime.Memory.Get(runtime.Scope,"season_maintenance")!)!;
             Check(maintenance["successfulResults"]!.AsArray().Count==15,"daily maintenance retains all successful receipts beyond the twelve-item recent window");
             var freshWorking=JsonNode.Parse(runtime.Memory.Get(runtime.Scope,"agent_working_state")!)!;
-            Check(freshWorking["currentObjective"]?.ToString()==""&&freshWorking["next"]!.AsArray().Count==0,"new native days retire the previous day's temporary objective and pending steps");
+            Check(freshWorking["currentObjective"]?.ToString()=="finish spring 1"&&freshWorking["next"]!.AsArray().Count==0,"new native days preserve the current objective and retire the previous day's pending steps");
             await runtime.Pause();
         }
         await using(var trial=new CompanionRuntime(trialBridge,new MemoryStore(Path.Combine(folder,"ten-day-boundary.db")),new ModelSettings(),new HttpClient(),Path.Combine(folder,"ten-day-boundary.jsonl"))){
@@ -194,15 +227,34 @@ internal static class PlanChecks
     private sealed class PlanModel(JsonObject args,PlanBridge bridge):HttpMessageHandler
     {
         public int Requests;public int BetweenStepRequests;
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken ct){
+        public int Continuations;public bool ContinuationWhileRunning;public bool SawContinuation;
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,CancellationToken ct){
+            var body=JsonNode.Parse(await request.Content!.ReadAsStringAsync(ct))!;
+            if(body["tools"]?.AsArray().Any(t=>t?["function"]?["name"]?.ToString()=="plan_continuation")==true){
+                var deadline=Environment.TickCount64+1000;
+                while(bridge.Commands.Count==0&&Environment.TickCount64<deadline)await Task.Delay(1,ct);
+                Continuations++;ContinuationWhileRunning=bridge.Commands.Count>0&&bridge.Observation!.ActiveTaskId!="";
+                if(bridge.Scenario is "failure" or "pause")await Task.Delay(200,ct);
+                var proposalCall=new{id="continuation",type="function",function=new{name="plan_continuation",arguments=JsonSerializer.Serialize(new{nextSteps=new[]{"harvest mature crops"},assumptions=new[]{"previous batch completed"},checksBeforeAction=new[]{"verify actual receipts and mature crops"},onFailure="replan from current observation"})}};
+                var proposalResponse=new{choices=new[]{new{message=new{role="assistant",content="",tool_calls=new[]{proposalCall}}}}};
+                return new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(proposalResponse))};
+            }
+            var input=JsonNode.Parse(body["messages"]![1]!["content"]!.GetValue<string>());
+            SawContinuation|=input?["continuation"]?["status"]?.ToString()=="hypothesis_requires_verification";
             if(bridge.Commands.Count is >0 and <8&&bridge.Scenario is "eight" or "save_then_execute")BetweenStepRequests++;
             Requests++;
             var calls=new List<object>();
+            if(bridge.Scenario=="direct"){
+                calls.Add(Requests==1
+                    ?new{id="direct",type="function",function=new{name="go_to",arguments=args["steps"]![0]!["arguments"]!.ToJsonString()}}
+                    :new{id="wait",type="function",function=new{name="wait_for_change",arguments="{\"seconds\":120,\"reason\":\"end test\"}"}});
+                return new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(new{choices=new[]{new{message=new{role="assistant",content="",tool_calls=calls}}}}))};
+            }
             if(bridge.Scenario=="save_then_execute")calls.Add(new{id="save",type="function",function=new{name="save_plan",arguments=JsonSerializer.Serialize(new{planId="test-plan",goal="reach declared targets",basis="observed state"})}});
             var skill=args["steps"]![0]!["skill"]!.GetValue<string>();
             calls.Add(new{id="plan",type="function",function=new{name="group_"+BusinessCapabilities.GroupFor(skill),arguments=bridge.Scenario=="invalid_json"&&Requests==1?"{\"planId\": 未引用}":args.ToJsonString()}});
             var response=new{choices=new[]{new{message=new{role="assistant",content="",tool_calls=calls}}}};
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(response))});
+            return new HttpResponseMessage(HttpStatusCode.OK){Content=new StringContent(JsonSerializer.Serialize(response))};
         }
     }
     private sealed class IdleModel:HttpMessageHandler

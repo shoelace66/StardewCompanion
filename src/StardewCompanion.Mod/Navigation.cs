@@ -1,4 +1,4 @@
-﻿using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework;
 using StardewCompanion.Protocol;
 using StardewValley;
 using StardewValley.TerrainFeatures;
@@ -6,7 +6,7 @@ using StardewValley.Tools;
 
 namespace StardewCompanion.Mod;
 
-internal sealed record MapEdge(string From, string To, GridPoint Tile, bool Interact, GridPoint? ArrivalTile);
+internal sealed record MapEdge(string From, string To, GridPoint Tile, bool Interact, GridPoint? ArrivalTile, int? OpenTime=null, int? CloseTime=null);
 
 internal sealed class Navigation
 {
@@ -21,9 +21,24 @@ internal sealed class Navigation
     private string _observedMap = "";
     private string _previousTransitionFrom = "";
     private string _previousTransitionTo = "";
+    private GridPoint? _arrivalClearance;
+    private HashSet<GridPoint> _arrivalExitTiles=new();
+    private int _mapBounces;
+    private readonly HashSet<MapEdge> _deadEndEntrances = new();
+    private MapEdge? _incomingEdge;
+    private string _routeFrom="";
+    private string _routeTo="";
+    private IReadOnlyList<MapEdge>? _routeCache;
+    private GridPoint? _routeApproachCache;
+    private bool _routeCacheInitialized;
     private GridPoint? _breakingTarget;
     private GridPoint? _breakingApproach;
     private long _breakWaitUntil;
+    private string? _breakingType;
+    private string? _breakingItemId;
+    private string? _breakingTool;
+    private readonly List<object> _brokenObstacles=new();
+    internal object[] BrokenObstacles=>_brokenObstacles.ToArray();
     internal string Reason { get; private set; } = "";
     internal bool AvoidMonsters { get; set; }
     internal static IEnumerable<MapEdge> Edges()
@@ -36,6 +51,7 @@ internal sealed class Navigation
             {var entry=farm.GetMainFarmHouseEntry();yield return new(l.NameOrUniqueName,home.NameOrUniqueName,new(entry.X,entry.Y-1),true,Arrival(home,l.NameOrUniqueName));}
             foreach (var w in l.warps)
             {
+                if (w.npcOnly.Value) continue;
                 var target = Game1.getLocationFromName(w.TargetName);
                 if (target != null && WorldView.Supported(target)) yield return new(l.NameOrUniqueName, target.NameOrUniqueName, new(w.X, w.Y), false, new(w.TargetX,w.TargetY));
             }
@@ -47,20 +63,43 @@ internal sealed class Navigation
             }
             foreach(var door in l.doors.Pairs){
                 var target=Game1.getLocationFromName(door.Value);
-                if(WorldView.Supported(target))yield return new(l.NameOrUniqueName,target.NameOrUniqueName,new(door.Key.X,door.Key.Y),true,Arrival(target!,l.NameOrUniqueName));
+                if(!WorldView.Supported(target))continue;
+                int? open=null,close=null;
+                var action=l.doesTileHaveProperty(door.Key.X,door.Key.Y,"Action","Buildings")?.Split(' ',StringSplitOptions.RemoveEmptyEntries);
+                if(action is {Length:>=6}&&action[0]=="LockedDoorWarp"){
+                    if(int.TryParse(action[4],out var openTime))open=openTime;
+                    if(int.TryParse(action[5],out var closeTime))close=closeTime;
+                }
+                yield return new(l.NameOrUniqueName,target!.NameOrUniqueName,new(door.Key.X,door.Key.Y),true,Arrival(target,l.NameOrUniqueName),open,close);
             }
         }
     }
     private static GridPoint? Arrival(GameLocation target,string from)
     {
-        var warp=target.warps.FirstOrDefault(w=>w.TargetName==from);
+        var warp=target.warps.FirstOrDefault(w=>!w.npcOnly.Value && w.TargetName==from);
         return warp==null?null:new GridPoint(warp.X,warp.Y);
     }
-    internal static IReadOnlyList<MapEdge>? Route(string from, string to)
+    internal static IReadOnlyList<MapEdge>? Route(string from, string to, HashSet<MapEdge>? excluded = null)
     {
         var currentMap=Game1.currentLocation?.NameOrUniqueName??"";var current=Current;
-        return Pathfinding.Dijkstra(from,to,Edges().ToArray(),e=>e.From,e=>e.To,
-            e=>100+(e.From==currentMap?e.Tile.Distance(current):0));
+        var edges=Edges().Where(edge => excluded?.Any(previous => previous.From == edge.From && previous.To == edge.To && Nullable.Equals(previous.ArrivalTile, edge.ArrivalTile)) != true).ToList();
+        while(true){
+            var route=Pathfinding.Dijkstra(from,to,edges,e=>e.From,e=>e.To,
+                e=>100+(e.From==currentMap?e.Tile.Distance(current):0));
+            if(route==null||route.Count==0||from!=currentMap)return route;
+            var first=route[0];var navigator=new Navigation();bool reachable;
+            if(first.Interact)reachable=navigator.BestAdjacent(first.Tile)!=null;
+            else if(Game1.currentLocation?.Map is {} currentMapData){
+                var layer=currentMapData.Layers[0];
+                var goal=new GridPoint(Math.Clamp(first.Tile.X,0,layer.LayerWidth-1),Math.Clamp(first.Tile.Y,0,layer.LayerHeight-1));
+                reachable=navigator.PreviewPath(goal)!=null;
+            }else reachable=false;
+            if(reachable)return route;
+            // Only the first edge must be reachable from the player's current
+            // position. Exclude that single blocked edge and ask Dijkstra for
+            // an alternative instead of running A* for every door on this map.
+            edges.RemoveAll(edge=>edge.Equals(first));
+        }
     }
     internal static GridPoint Current => new(Game1.player.TilePoint.X, Game1.player.TilePoint.Y);
     internal GridPoint SegmentGoal(string destination)
@@ -81,8 +120,8 @@ internal sealed class Navigation
         return !l.isCollidingPosition(new Rectangle(p.X * 64 + 8, p.Y * 64 + 16, 48, 32), Game1.viewport,
             true, 0, false, Game1.player, true, skipCollisionEffects: true);
     }
-    internal void Reset() { _path = null; _map = ""; _replans = 0; _transitionStarted = 0; _observedMap="";_previousTransitionFrom="";_previousTransitionTo="";_breakingTarget=null;_breakingApproach=null;_breakWaitUntil=0;Reason = ""; }
-    internal void Suspend() { _lastMove = Environment.TickCount64; _lastPosition = Game1.player.Position; }
+    internal void Reset() { _path = null; _map = ""; _replans = 0; _transitionStarted = 0; _observedMap="";_previousTransitionFrom="";_previousTransitionTo="";_arrivalClearance=null;_mapBounces=0;_deadEndEntrances.Clear();_incomingEdge=null;_routeFrom="";_routeTo="";_routeCache=null;_routeApproachCache=null;_routeCacheInitialized=false;_breakingTarget=null;_breakingApproach=null;_breakWaitUntil=0;_breakingType=null;_breakingItemId=null;_breakingTool=null;Reason = ""; }
+    internal void Suspend() { _lastMove = Environment.TickCount64; _lastPosition = Game1.player.Position;if(_transitionStarted!=0)_transitionStarted=_lastMove; }
     // Returns reached / moving / blocked / unsupported. Only emits normal held direction input.
     internal string Move(string location, GridPoint goal, AiInputSimulator input, Action<GridPoint> interact, bool breakNaturalObstacles=false)
     {
@@ -92,19 +131,71 @@ internal sealed class Navigation
         if(_observedMap=="")_observedMap=currentMap;
         else if(currentMap!=_observedMap){
             var from=_observedMap;
+            var traversed = _routeCache?.FirstOrDefault(edge => edge.From == from && edge.To == currentMap);
             if(from==_previousTransitionTo&&currentMap==_previousTransitionFrom){
-                _observedMap=currentMap;input.Clear();Reason=$"map_transition_bounced:{from}->{currentMap}";return "blocked";
+                // The farmer re-entered the warp it just came through (A->B->A),
+                // usually because arrival clearance did not step it off the
+                // incoming warp tile before re-navigating. Recover by clearing
+                // route state and stepping away from that warp, but bound the
+                // retries so a genuine oscillation still terminates.
+                if (_incomingEdge is {} failedEntrance) _deadEndEntrances.Add(failedEntrance);
+                _observedMap=currentMap;input.Clear();
+                _routeCache=null;_routeApproachCache=null;_routeCacheInitialized=false;
+                _transitionStarted=0;_path=null;_previousTransitionFrom="";_previousTransitionTo="";
+                _arrivalClearance=ArrivalClearance(from);
+                if(++_mapBounces>3){Reason=$"map_transition_bounced:{from}->{currentMap}";return "blocked";}
+                return "moving";
             }
+            // Do not reset _mapBounces here: an A<->B oscillation alternates a
+            // bounce with a normal hop, so resetting on every normal transition
+            // kept the counter pinned below the threshold and spun forever. It is
+            // cleared on reaching the goal and in Reset() instead.
+            _incomingEdge = traversed;
             _previousTransitionFrom=from;_previousTransitionTo=currentMap;_observedMap=currentMap;
+            _routeCache=null;_routeApproachCache=null;_routeCacheInitialized=false;_transitionStarted=0;_path=null;
+            if(currentMap!=location||Current.Distance(goal)>1)_arrivalClearance=ArrivalClearance(from);
+        }
+        if(_arrivalClearance is {} clearTile){
+            var clearing=Local(clearTile,input,false);
+            if(clearing is "blocked" or "unsupported"){Reason="arrival_clearance_unreachable:"+Reason;return clearing;}
+            if(clearing!="reached")return clearing;
+            _arrivalClearance=null;_path=null;input.Clear();return "moving";
         }
         if (here.NameOrUniqueName != location)
         {
-            var route = Route(here.NameOrUniqueName, location);
+            if(!_routeCacheInitialized||_routeFrom!=here.NameOrUniqueName||_routeTo!=location){
+                _routeFrom=here.NameOrUniqueName;_routeTo=location;
+                _routeCache = Route(_routeFrom, _routeTo, _deadEndEntrances);
+                if (_routeCache == null && _deadEndEntrances.Count > 0)
+                    _routeCache = Route(_routeFrom, _routeTo); // The only entrance may have bounced transiently.
+                var first=_routeCache?.FirstOrDefault();
+                // A map can contain disconnected walkable regions (e.g. Backwoods).
+                // If the only reachable route takes us straight back, avoid this
+                // entrance when planning the next leg from the previous map.
+                if (first != null && _incomingEdge is {} entrance && first.To == entrance.From)
+                    _deadEndEntrances.Add(entrance);
+                _routeApproachCache=first==null?null:first.Interact?BestAdjacent(first.Tile):new GridPoint(
+                    Math.Clamp(first.Tile.X,0,here.Map.Layers[0].LayerWidth-1),Math.Clamp(first.Tile.Y,0,here.Map.Layers[0].LayerHeight-1));
+                _routeCacheInitialized=true;
+            }
+            var route = _routeCache;
             if (route == null || route.Count == 0) { Reason = "no_supported_route"; return "blocked"; }
             var edge = route[0];
-            var approach = edge.Interact ? BestAdjacent(edge.Tile) : new GridPoint(
-                Math.Clamp(edge.Tile.X, 0, here.Map.Layers[0].LayerWidth - 1),
-                Math.Clamp(edge.Tile.Y, 0, here.Map.Layers[0].LayerHeight - 1));
+            // A general go_to may target a shop map before it opens. Native
+            // LockedDoorWarp actions otherwise display a blocking "It's
+            // locked" dialogue on every interaction attempt. Stop before
+            // approaching the door and return the native retry window instead.
+            var targetLocation=Game1.getLocationFromName(edge.To);
+            var townKeyBypass=Game1.player.HasTownKey&&targetLocation?.InValleyContext()==true;
+            if(!townKeyBypass&&edge.OpenTime is {} openTime&&Game1.timeOfDay<openTime){
+                Reason=$"destination_closed_until:{edge.To}:current={Game1.timeOfDay}:retryAt={openTime}";
+                input.Clear();return "blocked";
+            }
+            if(!townKeyBypass&&edge.CloseTime is {} closeTime&&Game1.timeOfDay>=closeTime){
+                Reason=$"destination_closed_for_today:{edge.To}:current={Game1.timeOfDay}:close={closeTime}";
+                input.Clear();return "blocked";
+            }
+            var approach = _routeApproachCache;
             if (approach == null) { Reason = "exit_unreachable"; return "blocked"; }
             var state = Local(approach.Value, input, false);
             if (state != "reached") return state;
@@ -120,7 +211,31 @@ internal sealed class Navigation
             return "moving";
         }
         _transitionStarted = 0;
-        return Local(goal, input, breakNaturalObstacles);
+        var reachedGoal = Local(goal, input, breakNaturalObstacles);
+        if (reachedGoal == "reached") { _mapBounces = 0; _deadEndEntrances.Clear(); _incomingEdge = null; }
+        return reachedGoal;
+    }
+    private GridPoint? ArrivalClearance(string previousMap)
+    {
+        var location=Game1.currentLocation;var current=Current;var layer=location.Map.Layers[0];
+        var exits=location.warps.Where(w=>!w.npcOnly.Value && w.TargetName==previousMap).Select(w=>new GridPoint(w.X,w.Y)).Where(p=>p.Distance(current)<=3).ToArray();
+        if(exits.Length==0)return null;
+        _arrivalExitTiles=exits.ToHashSet();
+        var candidates=Enumerable.Range(Math.Max(1,current.X-4),Math.Max(0,Math.Min(layer.LayerWidth-2,current.X+4)-Math.Max(1,current.X-4)+1))
+            .SelectMany(x=>Enumerable.Range(Math.Max(1,current.Y-4),Math.Max(0,Math.Min(layer.LayerHeight-2,current.Y+4)-Math.Max(1,current.Y-4)+1)).Select(y=>new GridPoint(x,y)))
+            .Where(p=>exits.All(exit=>p.Distance(exit)>=2)&&Passable(p)).OrderBy(p=>p.Distance(current));
+        foreach(var candidate in candidates){
+            var path=Pathfinding.AStar(current,candidate,p=>Passable(p)&&(p.Equals(current)||exits.All(exit=>!exit.Equals(p))));
+            if(path!=null)return candidate;
+        }
+        // Tight corridors may keep every tile within two of the incoming warp.
+        // Accept a tile that is merely off the warp so the farmer still leaves
+        // the exit instead of re-triggering it.
+        foreach(var candidate in candidates.Where(p=>exits.All(exit=>!exit.Equals(p)))){
+            var path=Pathfinding.AStar(current,candidate,p=>Passable(p)&&(p.Equals(current)||exits.All(exit=>!exit.Equals(p))));
+            if(path!=null)return candidate;
+        }
+        return null;
     }
     internal GridPoint? BestAdjacent(GridPoint target)
     {
@@ -154,6 +269,7 @@ internal sealed class Navigation
     private int? Cost(GridPoint p)=>Cost(p,false);
     private int? Cost(GridPoint p,bool breakNaturalObstacles)
     {
+        if(_arrivalClearance!=null&&!p.Equals(Current)&&_arrivalExitTiles.Contains(p))return null;
         var cost=EntryCost(p,breakNaturalObstacles);
         if(cost==null||!AvoidMonsters)return cost;
         var danger=Game1.currentLocation.characters.OfType<StardewValley.Monsters.Monster>()
@@ -205,7 +321,10 @@ internal sealed class Navigation
         }
         if(_breakingTarget is {} blocked)
         {
-            if(Passable(blocked)){_breakingTarget=null;_breakingApproach=null;_breakWaitUntil=0;_path=null;_index=0;return "moving";}
+            if(Passable(blocked)){
+                _brokenObstacles.Add(new{location=Game1.currentLocation.NameOrUniqueName,x=blocked.X,y=blocked.Y,type=_breakingType,itemId=_breakingItemId,tool=_breakingTool,verifiedRemoved=true});
+                _breakingTarget=null;_breakingApproach=null;_breakWaitUntil=0;_breakingType=null;_breakingItemId=null;_breakingTool=null;_path=null;_index=0;return "moving";
+            }
             if(!breakNaturalObstacles||BreakTool(blocked) is not {} tool){Reason="obstacle_no_longer_breakable";return "blocked";}
             if(_breakingApproach is not {} approach){Reason="breakable_obstacle_no_approach";return "blocked";}
             if(_path==null||!_path.LastOrDefault().Equals(approach)){
@@ -214,6 +333,7 @@ internal sealed class Navigation
             }
             if(FollowPath(_path,input)!="reached")return "moving";
             if(now<_breakWaitUntil)return "moving";
+            if(tool is not MeleeWeapon&&Game1.player.Stamina<2){input.Clear();Reason="insufficient_stamina:required_minimum=2";return "blocked";}
             Game1.player.CurrentToolIndex=Game1.player.Items.IndexOf(tool);
             Game1.player.faceDirection(blocked.X>approach.X?1:blocked.X<approach.X?3:blocked.Y>approach.Y?2:0);
             input.Tool=true;_breakWaitUntil=now+850;_lastMove=now;
@@ -222,6 +342,10 @@ internal sealed class Navigation
         if(breakNaturalObstacles&&_index<_path.Count&&!Passable(_path[_index])&&BreakTool(_path[_index])!=null)
         {
             _breakingTarget=_path[_index];_breakingApproach=BreakApproach(_breakingTarget.Value);
+            var point=new Vector2(_breakingTarget.Value.X,_breakingTarget.Value.Y);
+            if(Game1.currentLocation.objects.TryGetValue(point,out var obj)){_breakingType=obj.Name;_breakingItemId=obj.QualifiedItemId;}
+            else if(Game1.currentLocation.terrainFeatures.TryGetValue(point,out var feature)){_breakingType=feature.GetType().Name;_breakingItemId=null;}
+            _breakingTool=BreakTool(_breakingTarget.Value)?.GetType().Name;
             if(_breakingApproach==null){Reason="breakable_obstacle_no_approach";return "blocked";}
             _path=null;_index=0;return "moving";
         }
